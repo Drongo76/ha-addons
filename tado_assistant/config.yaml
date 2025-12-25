@@ -1,7 +1,7 @@
 name: "Tado Assistant (Ingress)"
 slug: "tado_assistant"
 description: "Tado Auto-Assist Alternative als HA Add-on mit Web UI (Ingress) + MQTT Entities."
-version: "0.2.4"
+version: "0.2.5"
 arch:
   - aarch64
   - amd64
