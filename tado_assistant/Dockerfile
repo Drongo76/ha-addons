@@ -3,6 +3,7 @@ FROM ${BUILD_FROM}
 
 RUN apk add --no-cache \
   bash \
+  ca-certificates \
   python3 \
   py3-flask \
   py3-requests \
