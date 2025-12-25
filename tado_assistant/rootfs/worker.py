@@ -10,9 +10,7 @@ OPTIONS_FILE = "/data/options.json"
 
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 TOKEN_URL = "https://login.tado.com/oauth2/token"
-ME_URL = "https://my.tado.com/api/v2/me"
 MOBILE_DEVICES_URL = "https://my.tado.com/api/v2/homes/{home_id}/mobileDevices"
-
 
 def load_json(path, default):
     try:
@@ -21,27 +19,32 @@ def load_json(path, default):
     except Exception:
         return default
 
-
 def slugify(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     return s.strip("_") or "device"
 
-
 def refresh_access_token(refresh_token: str) -> str:
+    # WICHTIG: Token Endpoint erwartet FORM body, nicht Query params
     r = requests.post(
         TOKEN_URL,
-        params={
+        data={
             "client_id": TADO_CLIENT_ID,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=25,
     )
-    r.raise_for_status()
+    if r.status_code != 200:
+        # Hilfreiche Ausgabe im Log (ohne den Token komplett zu zeigen)
+        try:
+            msg = r.text
+        except Exception:
+            msg = "<no body>"
+        raise RuntimeError(f"Token refresh failed: {r.status_code} {msg}")
     data = r.json()
     return data["access_token"]
-
 
 def fetch_mobile_devices(access_token: str, home_id: int):
     r = requests.get(
@@ -51,7 +54,6 @@ def fetch_mobile_devices(access_token: str, home_id: int):
     )
     r.raise_for_status()
     return r.json()
-
 
 def mqtt_connect(opts):
     host = (opts.get("mqtt_host") or "").strip()
@@ -69,7 +71,6 @@ def mqtt_connect(opts):
     client.connect(host, port, keepalive=30)
     client.loop_start()
     return client
-
 
 def publish_discovery(client, disc_prefix, base_topic, home_id, devices):
     device_block = {
@@ -92,7 +93,7 @@ def publish_discovery(client, disc_prefix, base_topic, home_id, devices):
     }
     client.publish(cfg_topic, json.dumps(payload), retain=True)
 
-    # Presence Binary Sensors (NEUER Pfad, damit HA nicht als Sensor cached)
+    # Presence Binary Sensors
     for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
@@ -112,7 +113,6 @@ def publish_discovery(client, disc_prefix, base_topic, home_id, devices):
         }
         client.publish(cfg_topic, json.dumps(payload), retain=True)
 
-
 def publish_states(client, base_topic, devices):
     home_count = 0
     for d in devices:
@@ -124,7 +124,6 @@ def publish_states(client, base_topic, devices):
         client.publish(f"{base_topic}/mobile_devices/{did}/state", state, retain=True)
 
     client.publish(f"{base_topic}/home_count/state", str(home_count), retain=True)
-
 
 def main():
     print("[worker] start")
@@ -144,30 +143,4 @@ def main():
     home_id = auth.get("home_id")
 
     if not refresh_token or not home_id:
-        print("[worker] auth fehlt (refresh_token/home_id) -> warte")
-        while True:
-            time.sleep(10)
-
-    client = mqtt_connect(opts)
-    print("[worker] mqtt connected")
-
-    # Discovery + initial states
-    access = refresh_access_token(refresh_token)
-    devices = fetch_mobile_devices(access, int(home_id))
-    publish_discovery(client, disc_prefix, base_topic, int(home_id), devices)
-    publish_states(client, base_topic, devices)
-    print(f"[worker] discovery+states published: {len(devices)} devices")
-
-    while True:
-        try:
-            access = refresh_access_token(refresh_token)
-            devices = fetch_mobile_devices(access, int(home_id))
-            publish_states(client, base_topic, devices)
-            print(f"[worker] states published: {len(devices)} devices")
-        except Exception as e:
-            print(f"[worker] error: {e}")
-        time.sleep(poll_seconds)
-
-
-if __name__ == "__main__":
-    main()
+        print("[worker] auth fehlt (refresh_token/home_id)
