@@ -25,6 +25,7 @@ def _read_json(path: str):
 
 
 def _write_json(path: str, data: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -55,7 +56,7 @@ def get_home_id(access_token: str):
 
 
 def page(title: str, body_html: str):
-    # Alles RELATIV wegen Ingress
+    # Wichtig für Ingress: alle internen Links/Actions sind RELATIV
     return f"""<!doctype html>
 <html lang="de">
 <head>
@@ -75,6 +76,7 @@ def page(title: str, body_html: str):
     .ok {{ color:#5eead4; }}
     .warn {{ color:#fbbf24; }}
     hr {{ border:none; border-top:1px solid #26262a; margin:18px 0; }}
+    pre {{ white-space:pre-wrap; background:#0f0f12; padding:12px; border-radius:12px; border:1px solid #2a2a30; }}
   </style>
 </head>
 <body>
@@ -106,7 +108,7 @@ def index():
         <div class="muted">Konto-Label: {label}</div>
       </div>
 
-      <div class="row" style="margin-bottom: 10px;">
+      <div class="row" style="margin-bottom:14px;">
         <form method="post" action="reset">
           <button class="btn" type="submit">Reset (Auth löschen)</button>
         </form>
@@ -161,7 +163,9 @@ def auth_start():
         "email_label": email_label,
     }
     _write_json(PENDING_FILE, pending)
-    return redirect("auth")
+
+    # FIX: Ingress-Redirect korrekt (sonst landet man auf /auth/auth)
+    return redirect("../auth")
 
 
 @app.get("/auth")
@@ -214,7 +218,8 @@ def auth_poll():
     p = _read_json(PENDING_FILE) or {}
     device_code = p.get("device_code")
     if not device_code:
-        return redirect("auth")
+        # FIX: Ingress-Redirect korrekt
+        return redirect("../auth")
 
     r = requests.post(
         TOKEN_URL,
@@ -231,15 +236,15 @@ def auth_poll():
         return page("Warten", f"""
           <h2 style="margin:0 0 10px 0;">Noch nicht bestätigt</h2>
           <p class="muted">Bei tado noch nicht final bestätigt oder zu früh gepollt.</p>
-          <pre style="white-space:pre-wrap; background:#0f0f12; padding:12px; border-radius:12px; border:1px solid #2a2a30;">{r.text}</pre>
-          <a class="btn primary" href="auth">Zurück</a>
+          <pre>{r.text}</pre>
+          <a class="btn primary" href="../auth">Zurück</a>
         """)
 
     token = r.json()
     refresh_token = token.get("refresh_token")
     access_token = token.get("access_token")
     if not refresh_token or not access_token:
-        return page("Fehler", "<h2>Fehler</h2><p class='muted'>Token-Antwort unvollständig.</p><a class='btn' href='auth'>Zurück</a>")
+        return page("Fehler", "<h2>Fehler</h2><p class='muted'>Token-Antwort unvollständig.</p><a class='btn' href='../auth'>Zurück</a>")
 
     home_id = get_home_id(access_token)
 
@@ -252,7 +257,8 @@ def auth_poll():
     _write_json(AUTH_FILE, auth)
     _delete(PENDING_FILE)
 
-    return redirect("./")
+    # FIX: nach erfolgreichem Login wieder sauber auf die Auth-Seite
+    return redirect("../auth")
 
 
 if __name__ == "__main__":
