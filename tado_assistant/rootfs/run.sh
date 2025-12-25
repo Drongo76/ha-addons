@@ -20,7 +20,8 @@ def index():
       </head>
       <body style="font-family: Arial, Helvetica, sans-serif; margin: 24px;">
         <div style="max-width: 720px;">
-          <img src="/static/tado.svg" alt="tado" style="height: 84px; display: block; margin-bottom: 18px;" />
+          <!-- IMPORTANT: no leading slash for Ingress -->
+          <img src="static/tado.svg" alt="tado" style="height: 84px; display: block; margin-bottom: 18px;" />
           <h2 style="margin: 0 0 10px 0;">Tado Assistant</h2>
           <p style="margin: 0 0 18px 0;">Weboberfläche (Ingress) ist aktiv. Login/Benutzerdaten kommen als nächster Schritt.</p>
         </div>
