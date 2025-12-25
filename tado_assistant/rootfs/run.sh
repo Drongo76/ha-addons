@@ -62,7 +62,7 @@ def get_home_id(access_token: str):
 
 
 def page(title: str, body_html: str):
-    # Wichtig: alle Links/Form-Actions RELATIV, damit Ingress-Prefix erhalten bleibt
+    # Wichtig: Links/Form-Actions RELATIV (Ingress!)
     return f"""<!doctype html>
 <html lang="de">
 <head>
@@ -82,6 +82,7 @@ def page(title: str, body_html: str):
     .ok {{ color:#5eead4; }}
     .warn {{ color:#fbbf24; }}
     a {{ color:#93c5fd; }}
+    hr {{ border:none; border-top:1px solid #26262a; margin:18px 0; }}
   </style>
 </head>
 <body>
@@ -115,7 +116,7 @@ def index():
 
       <h3 style="margin:18px 0 8px 0;">Login (Device Code Flow)</h3>
       <p class="muted" style="margin-top:0;">
-        Du startest hier den Login, bekommst einen Link + Code, bestätigst im Browser bei tado,
+        Du startest hier den Login, bekommst Link + Code, bestätigst bei tado,
         dann holst du hier das Token ab.
       </p>
 
@@ -132,11 +133,11 @@ def index():
         <a class="btn" href="auth">Login-Status öffnen</a>
       </div>
 
-      <hr style="border:none; border-top:1px solid #26262a; margin:18px 0;" />
+      <hr />
 
       <h3 style="margin:0 0 8px 0;">MQTT</h3>
       <p class="muted" style="margin-top:0;">
-        MQTT-Entities werden erst gesendet, wenn Auth OK + Home ID vorhanden ist.
+        MQTT wird erst aktiv, wenn Auth OK + Home ID vorhanden ist.
       </p>
     """
     return page("Tado Assistant", body)
@@ -166,8 +167,7 @@ def auth_start():
     }
     _write_json(PENDING_FILE, pending)
 
-    # wichtig: relativ, damit Ingress-Prefix bleibt
-    return redirect("..")
+    return redirect("..")  # relativ
 
 
 @app.get("/auth")
@@ -194,10 +194,7 @@ def auth_page():
 
     body = f"""
       <h2 style="margin:0 0 10px 0;">Login-Status</h2>
-
-      <div style="margin-bottom:14px;">
-        <div class="muted">Restzeit: <code>{remaining}</code> Sekunden</div>
-      </div>
+      <div class="muted" style="margin-bottom:14px;">Restzeit: <code>{remaining}</code> Sekunden</div>
 
       <div class="card" style="padding:14px; border-radius:14px;">
         <div style="margin-bottom:8px;">1) Link öffnen und bei tado bestätigen:</div>
@@ -211,10 +208,10 @@ def auth_page():
       </form>
 
       <p class="muted" style="margin-top:14px;">
-        Hinweis: Bitte nicht schneller als alle <code>{interval}</code> Sekunden drücken.
+        Bitte nicht schneller als alle <code>{interval}</code> Sekunden drücken.
       </p>
 
-      <hr style="border:none; border-top:1px solid #26262a; margin:18px 0;" />
+      <hr />
       <div class="muted">Aktueller Status: Auth={'OK' if ok else 'nicht eingerichtet'} / Home ID={home_id or '—'} / Konto-Label={email_label or '—'}</div>
     """
     return page("Login", body)
@@ -250,12 +247,7 @@ def auth_poll():
     refresh_token = token.get("refresh_token")
     access_token = token.get("access_token")
     if not refresh_token or not access_token:
-        body = """
-          <h2 style="margin:0 0 10px 0;">Fehler</h2>
-          <p class="muted">Token-Antwort war unvollständig.</p>
-          <a class="btn" href="../auth">Zurück</a>
-        """
-        return page("Fehler", body)
+        return page("Fehler", "<h2>Fehler</h2><p class='muted'>Token-Antwort unvollständig.</p><a class='btn' href='../auth'>Zurück</a>")
 
     home_id = get_home_id(access_token)
 
@@ -272,15 +264,14 @@ def auth_poll():
     except FileNotFoundError:
         pass
 
-    # zurück zur Startseite (relativ aus /auth/poll)
-    return redirect("../..")
+    return redirect("../..")  # zurück zur Startseite
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8099)
 PY
 
-# Worker (unverändert) starten, falls vorhanden
+# Worker starten (wichtig für MQTT)
 if [ -f /worker.py ]; then
   python3 /worker.py &
 fi
