@@ -1,306 +1,185 @@
-#!/usr/bin/with-contenv python3
-# -*- coding: utf-8 -*-
-
+#!/usr/bin/env python3
 import json
 import os
 import time
 from pathlib import Path
+from flask import Flask, request, redirect, url_for, render_template_string
 
-import requests
-from flask import Flask, request, redirect, Response
+APP_DIR = Path("/data/tado_assistant")
+APP_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_TITLE = "Tado Assistant Add-on (Ingress)"
+AUTH_FILE = APP_DIR / "auth.json"
 
-DATA_DIR = Path("/data")
-AUTH_FILE = DATA_DIR / "auth.json"
-DEVICE_FILE = DATA_DIR / "device.json"
+app = Flask(__name__)
 
-# --- tado OAuth endpoints (Device Code Flow) ---
-# (So wie in deinem Repo – NICHT ändern)
-DEVICE_AUTHORIZE_URL = "https://login.tado.com/oauth2/device_authorize"
-TOKEN_URL = "https://login.tado.com/oauth2/token"
+HTML_INDEX = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tado Assistant</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; max-width: 820px; }
+      .card { border: 1px solid #3333; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+      input { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #3333; }
+      button { padding: 10px 14px; border-radius: 10px; border: none; cursor: pointer; }
+      .btn { background: #ff4d2e; color: #fff; font-weight: 700; }
+      .btn2 { background: #222; color: #fff; font-weight: 700; }
+      .muted { color: #666; }
+      .row { display: flex; gap: 12px; align-items: center; }
+      .row > * { flex: 1; }
+      code { background: #0001; padding: 3px 6px; border-radius: 6px; }
+      a { word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Status</h2>
+      <p><b>Auth:</b> {{ "Eingerichtet" if auth_ok else "Nicht eingerichtet" }} &nbsp; <b>Home ID:</b> {{ home_id or "—" }}</p>
+      <p><b>Konto-Label:</b> {{ label or "—" }}</p>
+    </div>
 
-# Diese Werte sind in deinem Repo bereits so vorgesehen.
-# Falls du sie anders im Code hast, lass sie wie sie waren.
-CLIENT_ID = os.environ.get("TADO_CLIENT_ID", "").strip()
-SCOPE = os.environ.get("TADO_SCOPE", "offline_access").strip()
+    <div class="card">
+      <h2>Login (Device Code Flow)</h2>
+      <p class="muted">Du startest hier den Login, bekommst einen Link + Code, bestätigst im Browser bei tado, dann holst du hier das Token ab.</p>
+      <form method="post" action="auth/start">
+        <div class="row">
+          <input name="label" placeholder="Konto-Label (z.B. juergen@...)" value="{{ label or '' }}" />
+          <button class="btn" type="submit">Login starten</button>
+        </div>
+      </form>
+      <p style="margin-top:10px;">
+        <a class="btn2" style="display:inline-block; padding:10px 14px; border-radius:10px; text-decoration:none;" href="{{ url_for('auth_page') }}">Login-Status öffnen</a>
+      </p>
+    </div>
 
+    <div class="card">
+      <h2>MQTT Entities in Home Assistant</h2>
+      <p class="muted">Wenn MQTT im Add-on aktiviert ist, legt der Worker automatisch Entities an: pro tado Mobile Device ein <code>binary_sensor</code> (zuhause/weg) + ein Gesamt-Sensor (Anzahl zuhause).</p>
+    </div>
+  </body>
+</html>
+"""
 
-def read_json(path: Path):
+HTML_AUTH = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tado Login</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; max-width: 820px; }
+      .card { border: 1px solid #3333; border-radius: 12px; padding: 16px; }
+      button { padding: 10px 14px; border-radius: 10px; border: none; cursor: pointer; }
+      .btn { background: #ff4d2e; color: #fff; font-weight: 700; }
+      .btn2 { background: #222; color: #fff; font-weight: 700; }
+      .muted { color: #666; }
+      code { background: #0001; padding: 3px 6px; border-radius: 6px; }
+      a { word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Login-Status</h2>
+      {% if link and code %}
+        <p><b>Restzeit:</b> {{ expires_in }} Sekunden</p>
+        <p>1) Link öffnen und bei tado bestätigen:<br/>
+          <a href="{{ link }}" target="_blank">{{ link }}</a>
+        </p>
+        <p>2) Falls nötig Code eingeben:<br/>
+          <code>{{ code }}</code>
+        </p>
+
+        <form method="post" action="poll">
+          <button class="btn" type="submit">Token abrufen</button>
+          <a class="btn2" style="display:inline-block; padding:10px 14px; border-radius:10px; text-decoration:none;" href="{{ url_for('index') }}">Zurück</a>
+        </form>
+
+        <p class="muted" style="margin-top:10px;">Hinweis: Bitte nicht schneller als alle 5 Sekunden drücken.</p>
+      {% else %}
+        <p class="muted">Kein laufender Login. Geh zurück und drücke „Login starten“.</p>
+        <a class="btn2" style="display:inline-block; padding:10px 14px; border-radius:10px; text-decoration:none;" href="{{ url_for('index') }}">Zurück</a>
+      {% endif %}
+
+      <hr/>
+      <p><b>Aktueller Status:</b> Auth={{ "OK" if auth_ok else "NO" }} / Home ID={{ home_id or "—" }} / Konto-Label={{ label or "—" }}</p>
+      {% if message %}
+        <p><b>Info:</b> {{ message }}</p>
+      {% endif %}
+    </div>
+  </body>
+</html>
+"""
+
+def load_auth():
+    if AUTH_FILE.exists():
+        try:
+            return json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_auth(data: dict):
+    AUTH_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def load_addon_options():
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        with open("/data/options.json", "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return None
-
-
-def write_json(path: Path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def auth_status():
-    auth = read_json(AUTH_FILE) or {}
-    label = auth.get("email_label") or "—"
-    home = str(auth.get("home_id") or "—")
-    ok = "OK" if auth.get("access_token") else "Nicht eingerichtet"
-    return ok, home, label
-
-
-def page(body_html: str, title: str = "Tado Assistant"):
-    # Wichtig für Ingress: wenn HA die URL ohne "/" am Ende öffnet, verlieren relative Links den Token.
-    ingress = request.headers.get("X-Ingress-Path", "") or ""
-    if ingress and not ingress.endswith("/"):
-        ingress += "/"
-    base_tag = f'<base href="{ingress}">' if ingress else ""
-
-    return f"""<!doctype html>
-<html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  {base_tag}
-  <title>{title}</title>
-  <style>
-    body {{
-      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background:#0b0f14; color:#e7eef7;
-      display:flex; justify-content:center; padding:24px;
-    }}
-    .card {{
-      width:min(820px, 100%);
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 16px;
-      padding: 18px;
-      box-shadow: 0 12px 40px rgba(0,0,0,0.35);
-    }}
-    .header {{ display:flex; align-items:center; gap:14px; margin-bottom:14px; }}
-    .logo {{ height:48px; }}
-    h1 {{ font-size:20px; margin:0; font-weight:700; }}
-    .muted {{ opacity:0.75; font-size:13px; }}
-    .pill {{
-      display:inline-block; padding:6px 10px; border-radius:999px;
-      background: rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.10);
-      font-size:13px;
-    }}
-    hr {{ border:none; border-top:1px solid rgba(255,255,255,0.12); margin:14px 0; }}
-    .row {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
-    input {{
-      width: 100%;
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.14);
-      background: rgba(0,0,0,0.35);
-      color: #e7eef7;
-      font-size: 14px;
-      outline:none;
-    }}
-    .btn {{
-      display:inline-flex; align-items:center; justify-content:center;
-      padding: 10px 14px; border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.14);
-      background: rgba(255,255,255,0.08);
-      color: #e7eef7; text-decoration:none;
-      font-weight: 650; cursor:pointer;
-    }}
-    .btn.primary {{
-      background: #ff6a2b;
-      border-color: rgba(255,255,255,0.18);
-      color:#111;
-    }}
-    code {{
-      background: rgba(0,0,0,0.35);
-      padding: 2px 6px;
-      border-radius: 6px;
-      border: 1px solid rgba(255,255,255,0.14);
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    {body_html}
-  </div>
-</body>
-</html>"""
-
-
-def tado_start_device_flow(email_label: str) -> dict:
-    if not CLIENT_ID:
-        raise RuntimeError("TADO_CLIENT_ID fehlt (Environment).")
-
-    payload = {"client_id": CLIENT_ID, "scope": SCOPE}
-    r = requests.post(DEVICE_AUTHORIZE_URL, data=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-
-    data["email_label"] = email_label
-    data["started_at"] = int(time.time())
-    return data
-
-
-def tado_poll_token(device: dict) -> dict:
-    payload = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "device_code": device["device_code"],
-        "client_id": CLIENT_ID,
-    }
-    r = requests.post(TOKEN_URL, data=payload, timeout=30)
-    if r.status_code == 200:
-        return r.json()
-    try:
-        return {"error": r.json().get("error", "unknown_error"), "raw": r.text}
-    except Exception:
-        return {"error": "unknown_error", "raw": r.text}
-
-
-app = Flask(__name__, static_folder="/static", static_url_path="/static")
-
+        return {}
 
 @app.get("/")
 def index():
-    ok, home, label = auth_status()
-    body = f"""
-    <div class="header">
-      <img class="logo" src="static/tado.svg" alt="tado" />
-      <div>
-        <h1>{APP_TITLE}</h1>
-        <div class="muted">Status</div>
-      </div>
-    </div>
-
-    <div class="row" style="margin-bottom:10px;">
-      <span class="pill">Auth: <b>{ok}</b></span>
-      <span class="pill">Home ID: <b>{home}</b></span>
-      <span class="pill">Konto-Label: <b>{label}</b></span>
-    </div>
-
-    <div class="row" style="margin-bottom:14px;">
-      <form method="post" action="reset">
-        <button class="btn" type="submit">Reset (Auth löschen)</button>
-      </form>
-    </div>
-
-    <hr />
-
-    <h3 style="margin:0 0 8px 0;">Login (Device Code Flow)</h3>
-    <form method="post" action="auth/start">
-      <div class="row">
-        <div style="flex:1; min-width:260px;">
-          <input name="email_label" placeholder="Konto-Label (z.B. juergen@...)" />
-        </div>
-        <button class="btn primary" type="submit">Login starten</button>
-      </div>
-    </form>
-
-    <div style="margin-top:16px;">
-      <a class="btn" href="auth">Login-Status öffnen</a>
-    </div>
-
-    <hr />
-
-    <h3 style="margin:0 0 6px 0;">MQTT Entities in Home Assistant</h3>
-    <div class="muted">
-      Wenn MQTT im Add-on aktiviert ist, legt der Worker automatisch Entities an:
-      pro tado Mobile Device <code>binary_sensor</code> (zuhause/weg) + ein Gesamt-Sensor (Anzahl zuhause).
-    </div>
-    """
-    return Response(page(body, "Tado Assistant"), mimetype="text/html")
-
-
-@app.post("/reset")
-def reset():
-    try:
-        if AUTH_FILE.exists():
-            AUTH_FILE.unlink()
-        if DEVICE_FILE.exists():
-            DEVICE_FILE.unlink()
-    except Exception:
-        pass
-    return redirect("/")
-
-
-@app.post("/auth/start")
-def auth_start():
-    email_label = (request.form.get("email_label") or "").strip() or "tado"
-    device = tado_start_device_flow(email_label=email_label)
-    write_json(DEVICE_FILE, device)
-    return redirect("/auth")
-
+    auth = load_auth()
+    return render_template_string(
+        HTML_INDEX,
+        auth_ok=bool(auth.get("access_token")),
+        home_id=auth.get("home_id"),
+        label=auth.get("label"),
+    )
 
 @app.get("/auth")
 def auth_page():
-    device = read_json(DEVICE_FILE) or {}
-    ok, home, label = auth_status()
+    auth = load_auth()
+    return render_template_string(
+        HTML_AUTH,
+        link=auth.get("device_link"),
+        code=auth.get("user_code"),
+        expires_in=auth.get("expires_in", 0),
+        auth_ok=bool(auth.get("access_token")),
+        home_id=auth.get("home_id"),
+        label=auth.get("label"),
+        message=auth.get("message"),
+    )
 
-    expires_in = int(device.get("expires_in") or 0)
-    started_at = int(device.get("started_at") or 0)
-    now = int(time.time())
-    remaining = max(0, expires_in - (now - started_at)) if expires_in and started_at else 0
-
-    link = device.get("verification_uri_complete") or ""
-    code = device.get("user_code") or ""
-
-    body = f"""
-    <div class="header">
-      <img class="logo" src="static/tado.svg" alt="tado" />
-      <div>
-        <h1>Login-Status</h1>
-        <div class="muted">Restzeit: <code>{remaining}</code> Sekunden</div>
-      </div>
-    </div>
-
-    <div class="muted" style="margin-bottom:10px;">
-      Aktueller Status: Auth=<b>{ok}</b> / Home ID=<b>{home}</b> / Konto-Label=<b>{label}</b>
-    </div>
-
-    <hr />
-
-    <div style="margin-bottom:10px;">
-      <div><b>1) Link öffnen und bei tado bestätigen:</b></div>
-      <div style="margin-top:6px;">
-        <a href="{link}" target="_blank" rel="noreferrer">{link or "—"}</a>
-      </div>
-    </div>
-
-    <div style="margin-bottom:12px;">
-      <div><b>2) Falls nötig Code eingeben:</b></div>
-      <div style="margin-top:6px;"><code>{code or "—"}</code></div>
-    </div>
-
-    <div class="muted" style="margin-bottom:10px;">Hinweis: Bitte nicht schneller als alle 5 Sekunden drücken.</div>
-
-    <div class="row">
-      <form method="post" action="auth/poll">
-        <button class="btn primary" type="submit">Token abrufen</button>
-      </form>
-      <a class="btn" href="./">Zurück</a>
-    </div>
-    """
-    return Response(page(body, "Tado Assistant – Login"), mimetype="text/html")
-
+@app.post("/auth/start")
+def auth_start():
+    # Wichtig: NICHT auf "../auth" redirecten (das macht /auth/auth)
+    label = (request.form.get("label") or "").strip()
+    auth = load_auth()
+    auth["label"] = label
+    auth["message"] = ""
+    save_auth(auth)
+    # Gehe 1 Ebene hoch => /auth
+    return redirect("..")
 
 @app.post("/auth/poll")
 def auth_poll():
-    device = read_json(DEVICE_FILE) or {}
-    if not device.get("device_code"):
-        return redirect("/auth")
+    # Der Worker macht das eigentliche Token-Polling und schreibt in auth.json.
+    # Hier triggern wir nur „warte kurz“ UX.
+    auth = load_auth()
+    auth["message"] = "Token-Abfrage läuft… (bitte nach ein paar Sekunden Seite neu öffnen)"
+    save_auth(auth)
+    return redirect(url_for("auth_page"))
 
-    result = tado_poll_token(device)
-
-    if result.get("access_token"):
-        auth = {
-            "email_label": device.get("email_label") or "tado",
-            "access_token": result.get("access_token"),
-            "refresh_token": result.get("refresh_token"),
-            "expires_in": result.get("expires_in"),
-            "token_type": result.get("token_type", "Bearer"),
-            "obtained_at": int(time.time()),
-        }
-        write_json(AUTH_FILE, auth)
-
-    return redirect("/auth")
-
+@app.post("/reset")
+def reset():
+    if AUTH_FILE.exists():
+        AUTH_FILE.unlink()
+    return redirect(url_for("index"))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("WEB_PORT", "8099"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    opts = load_addon_options()
+    debug = bool(opts.get("debug", False))
+    app.run(host="0.0.0.0", port=8099, debug=debug)
