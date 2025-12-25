@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import requests
@@ -20,14 +21,22 @@ def load_json(path, default):
         return default
 
 
+def write_json(path: str, data: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def slugify(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     return s.strip("_") or "device"
 
 
-def refresh_access_token(refresh_token: str) -> str:
-    # FIX: Token Endpoint erwartet FORM body (data=...), nicht params=...
+def refresh_tokens(refresh_token: str):
+    # WICHTIG: FORM body, NICHT params (sonst landet Token in URL) 4
     r = requests.post(
         TOKEN_URL,
         data={
@@ -38,9 +47,25 @@ def refresh_access_token(refresh_token: str) -> str:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
     )
+
     if r.status_code != 200:
-        raise RuntimeError(f"Token refresh failed: {r.status_code} {r.text}")
-    return r.json()["access_token"]
+        # invalid_grant => Token ist tot, dann nicht crashen, sondern warten
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+
+        if isinstance(body, dict) and body.get("error") == "invalid_grant":
+            raise RuntimeError(f"AUTH_INVALID: {body}")
+
+        raise RuntimeError(f"TOKEN_REFRESH_FAILED: {r.status_code} {r.text}")
+
+    data = r.json()
+    access = data.get("access_token")
+    new_refresh = data.get("refresh_token")  # kann rotieren!
+    if not access:
+        raise RuntimeError("TOKEN_REFRESH_FAILED: access_token missing")
+    return access, (new_refresh or refresh_token)
 
 
 def fetch_mobile_devices(access_token: str, home_id: int):
@@ -95,7 +120,7 @@ def publish_discovery(client, disc_prefix, base_topic, home_id, devices):
         retain=True,
     )
 
-    # Presence Binary Sensors (NEUER discovery path + unique_id)
+    # Presence Binary Sensors (eigener Discovery-Pfad => keine Vermischung)
     for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
@@ -150,30 +175,46 @@ def main():
     refresh_token = auth.get("refresh_token")
     home_id = auth.get("home_id")
 
-    # FIX: keine kaputte Print-Zeile / keine SyntaxErrors
     if not refresh_token or not home_id:
         print("[worker] auth fehlt (refresh_token/home_id)")
         while True:
-            time.sleep(10)
+            time.sleep(5)
 
     client = mqtt_connect(opts)
     print("[worker] mqtt connected")
 
-    # Discovery + initial states
-    access = refresh_access_token(refresh_token)
-    devices = fetch_mobile_devices(access, int(home_id))
-    publish_discovery(client, disc_prefix, base_topic, int(home_id), devices)
-    publish_states(client, base_topic, devices)
-    print(f"[worker] discovery+states published: {len(devices)} devices")
+    discovery_done = False
 
     while True:
         try:
-            access = refresh_access_token(refresh_token)
+            access, refresh_token_new = refresh_tokens(refresh_token)
+
+            # Refresh-Token Rotation: speichern!
+            if refresh_token_new != refresh_token:
+                auth["refresh_token"] = refresh_token_new
+                auth["saved"] = int(time.time())
+                write_json(AUTH_FILE, auth)
+                refresh_token = refresh_token_new
+                print("[worker] refresh_token rotated+saved")
+
             devices = fetch_mobile_devices(access, int(home_id))
+
+            if not discovery_done:
+                publish_discovery(client, disc_prefix, base_topic, int(home_id), devices)
+                print(f"[worker] discovery published ({len(devices)} devices)")
+                discovery_done = True
+
             publish_states(client, base_topic, devices)
-            print(f"[worker] states published: {len(devices)} devices")
+            print(f"[worker] states published ({len(devices)} devices)")
+
         except Exception as e:
-            print(f"[worker] error: {e}")
+            # Bei AUTH_INVALID: du musst in der UI einmal Reset+Login machen
+            msg = str(e)
+            if msg.startswith("AUTH_INVALID:"):
+                print("[worker] AUTH INVALID -> bitte in Web UI: Reset + Login neu")
+            else:
+                print(f"[worker] error: {e}")
+
         time.sleep(poll_seconds)
 
 
