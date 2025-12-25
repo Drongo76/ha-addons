@@ -1,7 +1,7 @@
 name: "Tado Assistant (Ingress)"
 slug: "tado_assistant"
 description: "Tado Auto-Assist Alternative als HA Add-on mit Web UI (Ingress) + MQTT Entities."
-version: "0.2.6"
+version: "0.2.7"
 arch:
   - aarch64
   - amd64
@@ -27,11 +27,10 @@ options:
   mqtt_base_topic: "tado_assistant"
 
 schema:
-  poll_seconds: int(10,)
-  set_presence: bool
+  poll_seconds: int
   mqtt_enabled: bool
   mqtt_host: str
-  mqtt_port: int(1,65535)
+  mqtt_port: int
   mqtt_username: str
   mqtt_password: password
   mqtt_discovery_prefix: str
