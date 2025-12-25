@@ -3,7 +3,7 @@ FROM $BUILD_FROM
 
 RUN apk add --no-cache bash python3 py3-pip
 
-RUN pip3 install --no-cache-dir flask
+RUN pip3 install --no-cache-dir flask requests paho-mqtt
 
 COPY rootfs/ /
 RUN chmod +x /run.sh
