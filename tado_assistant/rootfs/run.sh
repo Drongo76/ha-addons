@@ -1,7 +1,6 @@
-#!/usr/bin/env bash
+#!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-mkdir -p /data/tado_assistant
-
 python3 /worker.py &
+
 exec python3 /app.py
