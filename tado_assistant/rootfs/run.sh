@@ -1,17 +1,19 @@
 #!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-# Marker: wenn du das NICHT im Log siehst, läuft nicht dein aktuelles Image!
-echo "### TADO-ASSISTANT run.sh LOADED (v0.2.6) ###"
-
-# Flask Debug/Reload MUSS aus (sonst: Restarting with stat + s6 loop)
 export FLASK_ENV="production"
 export FLASK_DEBUG="0"
+export WERKZEUG_DEBUG_PIN="off"
 
 export LOG_LEVEL="$(bashio::config 'log_level' 2>/dev/null || echo info)"
 export PORT="${PORT:-8099}"
 
-# Worker im Hintergrund (optional)
+export MQTT_ENABLED="$(bashio::config 'mqtt_enable' 2>/dev/null || echo false)"
+export MQTT_HOST="$(bashio::config 'mqtt_host' 2>/dev/null || echo '')"
+export MQTT_PORT="$(bashio::config 'mqtt_port' 2>/dev/null || echo 1883)"
+export MQTT_USERNAME="$(bashio::config 'mqtt_username' 2>/dev/null || echo '')"
+export MQTT_PASSWORD="$(bashio::config 'mqtt_password' 2>/dev/null || echo '')"
+
 python3 /worker.py &
 WORKER_PID=$!
 
@@ -21,5 +23,4 @@ _term() {
 }
 trap _term TERM INT
 
-# UI im Vordergrund
 exec python3 /app.py
