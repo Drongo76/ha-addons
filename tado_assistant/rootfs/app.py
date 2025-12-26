@@ -3,7 +3,7 @@ import json
 import time
 import logging
 from pathlib import Path
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, redirect, Response
 import requests
 from werkzeug.serving import run_simple
 
@@ -27,7 +27,7 @@ log = logging.getLogger("tado-assistant")
 app = Flask(__name__, static_folder="/static", static_url_path="/static")
 
 
-def load_json(path: Path, default=None):
+def _load_json(path: Path, default=None):
     try:
         if not path.exists():
             return default
@@ -37,22 +37,22 @@ def load_json(path: Path, default=None):
         return default
 
 
-def save_json(path: Path, data):
+def _save_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def token_status():
-    auth = load_json(AUTH_FILE, default={}) or {}
-    exp = float(auth.get("expires_at", 0) or 0)
-    now = time.time()
-    ok = bool(auth.get("access_token")) and exp > now + 30
-    return ok, exp, auth
+def _token_ok(auth: dict) -> bool:
+    try:
+        exp = float(auth.get("expires_at", 0) or 0)
+    except Exception:
+        exp = 0.0
+    return bool(auth.get("access_token")) and exp > time.time() + 30
 
 
-def html_page(body: str):
+def _html(body: str) -> str:
     css = """
     <style>
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; }
       .wrap { max-width: 900px; margin: 0 auto; }
       .top { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
       .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 14px 0; }
@@ -61,8 +61,10 @@ def html_page(body: str):
       button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #f8f8f8; cursor:pointer; }
       button.primary { background: #111; color:#fff; border-color:#111; }
       a { color: inherit; }
-      .ok { color: #0a7; font-weight: 600; }
-      .bad { color: #c22; font-weight: 600; }
+      .ok { color: #0a7; font-weight: 700; }
+      .bad { color: #c22; font-weight: 700; }
+      .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+      .code { display:inline-block; padding: 6px 10px; border:1px solid #ddd; border-radius:10px; background:#fafafa; }
     </style>
     """
     header = """
@@ -74,104 +76,147 @@ def html_page(body: str):
       <img src="/static/tado.svg" alt="tado" style="height:28px; opacity:.9"/>
     </div>
     """
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"{css}</head><body><div class='wrap'>{header}{body}</div></body></html>"
-    )
+    return f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>{css}</head><body><div class='wrap'>{header}{body}</div></body></html>"
 
 
 @app.get("/")
 def index():
-    ok, exp, auth = token_status()
-    email = auth.get("account_label", "")
+    auth = _load_json(AUTH_FILE, default={}) or {}
+    ok = _token_ok(auth)
+
+    exp = 0.0
+    try:
+        exp = float(auth.get("expires_at", 0) or 0)
+    except Exception:
+        exp = 0.0
+
     exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "—"
+    email = auth.get("account_label") or "—"
+
+    flow = _load_json(DEVICE_FLOW_FILE, default={}) or {}
+    user_code = flow.get("user_code")
+    verification_uri = flow.get("verification_uri_complete") or flow.get("verification_uri")
 
     status_line = "<span class='ok'>✅ Token OK</span>" if ok else "<span class='bad'>❌ Kein/abgelaufener Token</span>"
-    home_line = f"<span class='muted'>gültig bis: {exp_str}</span>" if exp else ""
+    flow_block = ""
+    if user_code and verification_uri:
+        flow_block = f"""
+        <div class="card">
+          <h3 style="margin-top:0;">Login Schritt</h3>
+          <div class="muted">Öffne diesen Link und gib den Code ein:</div>
+          <div class="row" style="margin-top:10px;">
+            <a class="code mono" href="{verification_uri}" target="_blank" rel="noopener noreferrer">{verification_uri}</a>
+            <span class="code mono">Code: {user_code}</span>
+          </div>
+          <div class="muted" style="margin-top:10px;">Danach: <b>Token abrufen (poll)</b>.</div>
+        </div>
+        """
 
     body = f"""
     <div class="card">
-      <h2>Status</h2>
-      <div>{status_line} &nbsp;&nbsp; {home_line}</div>
-      <div class="muted" style="margin-top:8px;">Konto-Label: {email or "—"}</div>
+      <h2 style="margin-top:0;">Status</h2>
+      <div>{status_line}</div>
+      <div class="muted" style="margin-top:8px;">gültig bis: {exp_str}</div>
+      <div class="muted" style="margin-top:4px;">Konto-Label: {email}</div>
     </div>
 
     <div class="card">
-      <h2>Login (Device Code Flow)</h2>
-      <div class="muted">
-        Du startest hier den Login, bekommst einen Link + Code, bestätigst im Browser bei tado,
-        dann holst du hier das Token ab.
-      </div>
-
-      <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
-        <form method="post" action="/api/device/start"><button class="primary" type="submit">Login starten</button></form>
-        <form method="post" action="/api/device/poll"><button type="submit">Token abrufen (poll)</button></form>
+      <h2 style="margin-top:0;">Login (Device Code Flow)</h2>
+      <div class="row" style="margin-top:12px;">
+        <form method="post" action="/auth/start"><button class="primary" type="submit">Login starten</button></form>
+        <form method="post" action="/auth/poll"><button type="submit">Token abrufen (poll)</button></form>
+        <form method="post" action="/auth/clear"><button type="submit">Token löschen</button></form>
       </div>
     </div>
+
+    {flow_block}
     """
-    return Response(html_page(body), mimetype="text/html")
+    return Response(_html(body), mimetype="text/html")
 
 
-@app.post("/api/device/start")
-def device_start():
+@app.post("/auth/start")
+def auth_start():
     payload = {"client_id": CLIENT_ID, "scope": SCOPE}
-    r = requests.post(DEVICE_AUTHORIZE_URL, data=payload, timeout=20)
+    r = requests.post(DEVICE_AUTHORIZE_URL, data=payload, timeout=30)
     r.raise_for_status()
     flow = r.json()
-    flow["account_label"] = request.form.get("account_label", "")
-    save_json(DEVICE_FLOW_FILE, flow)
-    return jsonify(flow)
+    flow["account_label"] = (request.form.get("account_label") or "").strip()
+    _save_json(DEVICE_FLOW_FILE, flow)
+    return redirect("/", code=302)
 
 
-@app.post("/api/device/poll")
-def device_poll():
-    flow = load_json(DEVICE_FLOW_FILE, default={}) or {}
+@app.post("/auth/poll")
+def auth_poll():
+    flow = _load_json(DEVICE_FLOW_FILE, default={}) or {}
     device_code = flow.get("device_code")
     if not device_code:
-        return jsonify({"error": "no_device_code"}), 400
+        return redirect("/", code=302)
 
     payload = {
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         "client_id": CLIENT_ID,
         "device_code": device_code,
     }
-    r = requests.post(TOKEN_URL, data=payload, timeout=20)
+    r = requests.post(TOKEN_URL, data=payload, timeout=30)
 
     if r.status_code != 200:
         try:
             err = r.json()
         except Exception:
             err = {"raw": r.text}
-        return jsonify({"error": err}), 400
+        log.warning("token poll failed: %s", err)
+        return redirect("/", code=302)
 
     tok = r.json()
-    auth = load_json(AUTH_FILE, default={}) or {}
+    auth = _load_json(AUTH_FILE, default={}) or {}
     auth.update(
         {
-            "account_label": flow.get("account_label", ""),
+            "account_label": flow.get("account_label", "") or auth.get("account_label", ""),
             "access_token": tok.get("access_token"),
-            "refresh_token": tok.get("refresh_token"),
+            "refresh_token": tok.get("refresh_token") or auth.get("refresh_token"),
             "expires_at": time.time() + int(tok.get("expires_in", 0) or 0),
         }
     )
-    save_json(AUTH_FILE, auth)
+    _save_json(AUTH_FILE, auth)
     log.info("Auth stored (refresh_token present=%s)", bool(auth.get("refresh_token")))
-    return jsonify({"ok": True})
+    return redirect("/", code=302)
+
+
+@app.post("/auth/clear")
+def auth_clear():
+    try:
+        if AUTH_FILE.exists():
+            AUTH_FILE.unlink()
+    except Exception:
+        pass
+    try:
+        if DEVICE_FLOW_FILE.exists():
+            DEVICE_FLOW_FILE.unlink()
+    except Exception:
+        pass
+    return redirect("/", code=302)
+
+
+@app.get("/api/status")
+def api_status():
+    auth = _load_json(AUTH_FILE, default={}) or {}
+    return {
+        "token_ok": _token_ok(auth),
+        "expires_at": auth.get("expires_at"),
+        "account_label": auth.get("account_label"),
+    }
 
 
 if __name__ == "__main__":
     os.environ["FLASK_ENV"] = "production"
     os.environ["FLASK_DEBUG"] = "0"
+    os.environ["WERKZEUG_DEBUG_PIN"] = "off"
 
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("HOST", "0.0.0.0") or "0.0.0.0"
     port = int(os.getenv("PORT", "8099") or "8099")
 
-    run_simple(
-        hostname=host,
-        port=port,
-        application=app,
-        use_reloader=False,
-        use_debugger=False,
-        threaded=True,
-    )
+    app.debug = False
+    app.config["ENV"] = "production"
+
+    log.info("Starting web UI on %s:%s", host, port)
+    run_simple(hostname=host, port=port, application=app, use_reloader=False, use_debugger=False, threaded=True)
