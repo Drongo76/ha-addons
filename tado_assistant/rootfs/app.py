@@ -1,13 +1,14 @@
 import json
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 from flask import Flask, redirect, request
 
 app = Flask(__name__)
 
-# Tado Device Code Flow (wie im offiziellen Support-Artikel)
+# Tado Device Code Flow (offiziell)
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 DEVICE_AUTHORIZE_URL = "https://login.tado.com/oauth2/device_authorize"
 TOKEN_URL = "https://login.tado.com/oauth2/token"
@@ -47,12 +48,32 @@ def _delete_file(path: str):
 
 
 def _back():
-    """
-    Ingress-sicher zurück:
-    - Referer (enthält /api/hassio_ingress/<token>/...)
-    - sonst '../../' (von /auth/* zurück zur Root-Seite innerhalb Ingress)
-    """
+    # Ingress-sicher zurück zur vorherigen Seite
     return request.headers.get("Referer") or "../../"
+
+
+def _add_query_params(url: str, extra: dict) -> str:
+    """Fügt Query-Parameter hinzu/überschreibt sie (Ingress-unabhängig)."""
+    p = urlparse(url)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    for k, v in extra.items():
+        if v is None:
+            continue
+        q[k] = v
+    new_query = urlencode(q)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+
+
+def _make_login_link(flow: dict) -> str:
+    """
+    Baut immer einen funktionierenden Link:
+    - wenn verification_uri_complete fehlt oder unvollständig ist -> ergänzen wir client_id
+    - user_code wird ebenfalls sicher gesetzt
+    """
+    base = flow.get("verification_uri_complete") or flow.get("verification_uri") or "https://login.tado.com/oauth2/device"
+    user_code = flow.get("user_code", "")
+    # Tado will hier client_id sehen:
+    return _add_query_params(base, {"user_code": user_code, "client_id": TADO_CLIENT_ID})
 
 
 def _html_page(title: str, body: str) -> str:
@@ -90,10 +111,7 @@ def index():
     tokens = _read_json(TOKEN_FILE)
     flow = _read_json(FLOW_FILE)
 
-    # WICHTIG für Ingress:
-    # - Form actions NIE mit führendem "/" (sonst geht's zu HA /auth/... => 404)
-    # - alles relativ: "auth/start" etc.
-
+    # Wichtig für Ingress: Form actions relativ (ohne führendes "/")
     if tokens and tokens.get("refresh_token"):
         body = """
         <p class="ok">✅ Eingeloggt</p>
@@ -106,8 +124,8 @@ def index():
         """
         return _html_page("Tado Assistant (Ingress)", body)
 
-    if flow and flow.get("verification_uri_complete"):
-        link = flow["verification_uri_complete"]
+    if flow and flow.get("device_code"):
+        link = _make_login_link(flow)
         code = flow.get("user_code", "")
         body = f"""
         <p>🔐 Login läuft. Öffne den Link und bestätige.</p>
@@ -139,10 +157,11 @@ def index():
 
 @app.post("/auth/start")
 def auth_start():
+    # WICHTIG: Tado erwartet das als FORM BODY, nicht als Query params
     try:
         r = requests.post(
             DEVICE_AUTHORIZE_URL,
-            params={"client_id": TADO_CLIENT_ID, "scope": "offline_access"},
+            data={"client_id": TADO_CLIENT_ID, "scope": "offline_access"},
             timeout=20,
         )
         data = r.json()
@@ -154,8 +173,6 @@ def auth_start():
 
     data["_created_at"] = _now_iso()
     _write_json(FLOW_FILE, data)
-
-    # Ingress-sicher zurück zur UI
     return redirect(_back(), code=303)
 
 
@@ -171,7 +188,7 @@ def auth_poll():
     try:
         r = requests.post(
             TOKEN_URL,
-            params={
+            data={
                 "client_id": TADO_CLIENT_ID,
                 "device_code": device_code,
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
@@ -193,8 +210,6 @@ def auth_poll():
         err = data.get("error", "") or data.get("error_description", "")
     err = err or str(data)
 
-    # Wichtig: In dieser Seite posten wir wieder auf dieselbe Route.
-    # action="" ist ingress-sicher und bleibt auf /auth/poll
     body = f"""
     <p class="error">Noch kein Token: <span class="mono">{err}</span></p>
     <p class="muted">Wenn du gerade bestätigt hast: warte {interval}s und klicke nochmal.</p>
