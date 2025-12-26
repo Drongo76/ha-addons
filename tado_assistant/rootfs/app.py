@@ -3,11 +3,11 @@ import os
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, redirect, url_for
+from flask import Flask, redirect, request
 
 app = Flask(__name__)
 
-# Tado Device Code Flow
+# Tado Device Code Flow (wie im offiziellen Support-Artikel)
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 DEVICE_AUTHORIZE_URL = "https://login.tado.com/oauth2/device_authorize"
 TOKEN_URL = "https://login.tado.com/oauth2/token"
@@ -46,6 +46,15 @@ def _delete_file(path: str):
         pass
 
 
+def _back():
+    """
+    Ingress-sicher zurück:
+    - Referer (enthält /api/hassio_ingress/<token>/...)
+    - sonst '../../' (von /auth/* zurück zur Root-Seite innerhalb Ingress)
+    """
+    return request.headers.get("Referer") or "../../"
+
+
 def _html_page(title: str, body: str) -> str:
     return f"""<!doctype html>
 <html>
@@ -63,8 +72,8 @@ def _html_page(title: str, body: str) -> str:
     .row {{ margin-top: 12px; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
     .muted {{ color: #666; }}
-    .error {{ color: #b00020; font-weight: 600; }}
-    .ok {{ color: #0a7a2f; font-weight: 600; }}
+    .error {{ color: #b00020; font-weight: 700; }}
+    .ok {{ color: #0a7a2f; font-weight: 700; }}
   </style>
 </head>
 <body>
@@ -81,11 +90,14 @@ def index():
     tokens = _read_json(TOKEN_FILE)
     flow = _read_json(FLOW_FILE)
 
-    # WICHTIG für Ingress: alle Actions/Links RELATIV (ohne führendes "/")
+    # WICHTIG für Ingress:
+    # - Form actions NIE mit führendem "/" (sonst geht's zu HA /auth/... => 404)
+    # - alles relativ: "auth/start" etc.
+
     if tokens and tokens.get("refresh_token"):
         body = """
         <p class="ok">✅ Eingeloggt</p>
-        <p class="muted">Token gespeichert in <code>/data/tado_tokens.json</code></p>
+        <p class="muted">Tokens gespeichert in <code>/data/tado_tokens.json</code></p>
         <div class="row">
           <form method="post" action="auth/logout">
             <button type="submit" class="secondary">Logout (Tokens löschen)</button>
@@ -98,7 +110,7 @@ def index():
         link = flow["verification_uri_complete"]
         code = flow.get("user_code", "")
         body = f"""
-        <p>🔐 Login läuft bereits. Öffne den Link auf Handy/PC und bestätige.</p>
+        <p>🔐 Login läuft. Öffne den Link und bestätige.</p>
         <p><a class="button" href="{link}" target="_blank" rel="noreferrer">Tado Login öffnen</a></p>
         <p>Code: <span class="mono"><b>{code}</b></span></p>
         <div class="row">
@@ -143,15 +155,15 @@ def auth_start():
     data["_created_at"] = _now_iso()
     _write_json(FLOW_FILE, data)
 
-    # Ingress-sicher: relativ zurück zur Startseite
-    return redirect("./", code=302)
+    # Ingress-sicher zurück zur UI
+    return redirect(_back(), code=303)
 
 
 @app.post("/auth/poll")
 def auth_poll():
     flow = _read_json(FLOW_FILE)
     if not flow or "device_code" not in flow:
-        return redirect("./", code=302)
+        return redirect(_back(), code=303)
 
     device_code = flow["device_code"]
     interval = int(flow.get("interval", 5))
@@ -174,36 +186,38 @@ def auth_poll():
         tokens = {**data, "_obtained_at": _now_iso()}
         _write_json(TOKEN_FILE, tokens)
         _delete_file(FLOW_FILE)
-        return redirect("./", code=302)
+        return redirect(_back(), code=303)
 
     err = ""
     if isinstance(data, dict):
         err = data.get("error", "") or data.get("error_description", "")
     err = err or str(data)
 
-    hint = f"""
+    # Wichtig: In dieser Seite posten wir wieder auf dieselbe Route.
+    # action="" ist ingress-sicher und bleibt auf /auth/poll
+    body = f"""
     <p class="error">Noch kein Token: <span class="mono">{err}</span></p>
-    <p class="muted">Tipp: Wenn du den Login gerade erst bestätigt hast, warte {interval} Sekunden und klicke nochmal.</p>
+    <p class="muted">Wenn du gerade bestätigt hast: warte {interval}s und klicke nochmal.</p>
     <div class="row">
-      <form method="post" action="poll">
+      <form method="post" action="">
         <button type="submit">Nochmal Token holen</button>
       </form>
     </div>
     <div class="row">
-      <a class="button secondary" href="./">Zurück</a>
+      <a class="button secondary" href="../../">Zurück</a>
     </div>
     """
-    return _html_page("Tado Login Status", hint)
+    return _html_page("Tado Login Status", body)
 
 
 @app.post("/auth/reset")
 def auth_reset():
     _delete_file(FLOW_FILE)
-    return redirect("./", code=302)
+    return redirect(_back(), code=303)
 
 
 @app.post("/auth/logout")
 def auth_logout():
     _delete_file(TOKEN_FILE)
     _delete_file(FLOW_FILE)
-    return redirect("./", code=302)
+    return redirect(_back(), code=303)
