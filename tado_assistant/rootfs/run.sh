@@ -1,16 +1,19 @@
 #!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-# Alles killen, was Flask in Debug/ReLoader bringen könnte
-unset FLASK_DEBUG
-unset FLASK_ENV
-unset FLASK_RUN_EXTRA_FILES
-unset FLASK_RUN_FROM_CLI
-
+# Log-Level aus Add-on Konfiguration
 export LOG_LEVEL="$(bashio::config 'log_level' 2>/dev/null || echo info)"
+
+# WICHTIG: Flask Debug/ReLoader MUSS aus sein, sonst beendet sich PID1 (Restart-Loop).
+export FLASK_ENV="production"
+export FLASK_DEBUG="0"
+
+# Ingress-Port (optional über ENV überschreibbar)
 export PORT="${PORT:-8099}"
 
-# Worker optional im Hintergrund
+echo "[tado-assistant] run.sh: LOG_LEVEL=${LOG_LEVEL} PORT=${PORT} FLASK_ENV=${FLASK_ENV} FLASK_DEBUG=${FLASK_DEBUG}"
+
+# Worker im Hintergrund starten (MQTT / Polling / Updates)
 python3 /worker.py &
 WORKER_PID=$!
 
@@ -20,11 +23,5 @@ _term() {
 }
 trap _term TERM INT
 
-# WSGI-Server im Vordergrund (stabil unter s6!)
-exec gunicorn \
-  --workers 1 \
-  --threads 4 \
-  --bind "0.0.0.0:${PORT}" \
-  --access-logfile "-" \
-  --error-logfile "-" \
-  "app:app"
+# Web-UI (Ingress) im Vordergrund starten
+exec python3 /app.py
