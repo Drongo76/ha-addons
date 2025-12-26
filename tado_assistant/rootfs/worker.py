@@ -1,377 +1,383 @@
-#!/usr/bin/env python3
-import os
 import json
+import os
+import sys
 import time
-import logging
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
 try:
-    import paho.mqtt.client as mqtt  # type: ignore
+    import paho.mqtt.client as mqtt
 except Exception:
-    mqtt = None
+    mqtt = None  # MQTT optional
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
-log = logging.getLogger("tado_worker")
 
-DATA_DIR = Path("/data")
-AUTH_FILE = DATA_DIR / "tado_auth.json"
-OPTIONS_FILE = Path("/data/options.json")  # HA Add-on options
+# ===== Paths (Add-on isoliert / konfliktfrei) =====
+DATA_DIR = "/data"
+TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
+LAST_TOKEN_RESP_PATH = os.path.join(DATA_DIR, "tado_assistant_last_token_response.json")
+OPTIONS_PATH = os.path.join(DATA_DIR, "options.json")
 
+# ===== Tado OAuth + API =====
+TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 TOKEN_URL = "https://login.tado.com/oauth2/token"
-CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
-API_BASE = "https://my.tado.com/api/v2"
+API_BASE = "https://my.tado.com/api/v2"  # community spec beschreibt /api/v2 + Start mit /me :contentReference[oaicite:2]{index=2}
 
-DEFAULT_POLL_SECONDS = 30
+# ===== Defaults =====
+DEFAULT_POLL_SECONDS = 60
+TOKEN_REFRESH_SAFETY_SECONDS = 90  # refresh etwas vor Ablauf
+HTTP_TIMEOUT = 20
 
 
-def load_json(path: Path, default: Any) -> Any:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def log(msg: str) -> None:
+    print(f"[worker] {msg}", flush=True)
+
+
+def read_json(path: str) -> Optional[Dict[str, Any]]:
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
     except Exception as e:
-        log.error("Failed reading %s: %s", path, e)
-    return default
+        log(f"WARN: cannot read json {path}: {e}")
+        return None
 
 
-def save_json(path: Path, data: Any) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        log.error("Failed writing %s: %s", path, e)
+def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 def load_options() -> Dict[str, Any]:
-    # HA Add-on injects options.json under /data
-    return load_json(OPTIONS_FILE, default={}) or {}
+    opt = read_json(OPTIONS_PATH) or {}
+    # minimale Defaults
+    opt.setdefault("poll_interval", DEFAULT_POLL_SECONDS)
+    opt.setdefault("mqtt", {})  # mqtt: {enabled, host, port, username, password, topic_prefix, tls}
+    opt.setdefault("topic_prefix", "tado_assistant")
+    return opt
 
 
-def load_auth() -> Dict[str, Any]:
-    return load_json(AUTH_FILE, default={}) or {}
+def tokens_exist() -> bool:
+    return os.path.exists(TOKENS_PATH)
 
 
-def save_auth(auth: Dict[str, Any]) -> None:
-    save_json(AUTH_FILE, auth)
-
-
-def auth_has_valid_access(auth: Dict[str, Any]) -> bool:
-    access = auth.get("access_token")
-    exp = float(auth.get("expires_at", 0) or 0)
-    return bool(access) and (time.time() < exp - 30)
-
-
-def refresh_access_token(auth: Dict[str, Any]) -> Dict[str, Any]:
+def parse_obtained_at(tokens: Dict[str, Any]) -> Optional[int]:
     """
-    Refresh token flow.
-    Never raises. On invalid refresh token -> clears refresh_token so UI can re-login.
+    Tokens kommen bei uns mit _obtained_at ISO. Falls nicht, versuchen wir epoch-Felder.
     """
-    refresh_token = auth.get("refresh_token")
+    if "_obtained_at_epoch" in tokens:
+        try:
+            return int(tokens["_obtained_at_epoch"])
+        except Exception:
+            pass
+    s = tokens.get("_obtained_at")
+    if not s:
+        return None
+    try:
+        # ISO parse ohne externe libs: grob, reicht hier.
+        # Beispiel: 2025-12-27T00:29:12.123456+00:00
+        dt = datetime.fromisoformat(s)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def token_expires_at(tokens: Dict[str, Any]) -> Optional[int]:
+    obtained = parse_obtained_at(tokens)
+    expires_in = tokens.get("expires_in")
+    try:
+        expires_in = int(expires_in)
+    except Exception:
+        expires_in = None
+    if obtained is None or expires_in is None:
+        return None
+    return obtained + expires_in
+
+
+def token_needs_refresh(tokens: Dict[str, Any]) -> bool:
+    exp = token_expires_at(tokens)
+    if exp is None:
+        # wenn wir es nicht wissen: lieber refresh versuchen (aber nur wenn refresh_token da ist)
+        return True
+    return int(time.time()) >= (exp - TOKEN_REFRESH_SAFETY_SECONDS)
+
+
+def refresh_tokens(tokens: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """
+    Refresh über OAuth2 refresh_token Grant. (Tado Device Code Flow Tokens sind refreshbar) :contentReference[oaicite:3]{index=3}
+    """
+    refresh_token = tokens.get("refresh_token")
     if not refresh_token:
-        return auth
+        return False, "missing refresh_token", None
 
-    if auth_has_valid_access(auth):
-        return auth
+    payload = {
+        "client_id": TADO_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
 
     try:
-        r = requests.post(
-            TOKEN_URL,
-            data={
-                "client_id": CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            },
-            timeout=20,
-        )
+        r = requests.post(TOKEN_URL, data=payload, timeout=HTTP_TIMEOUT)
+        data = r.json()
     except Exception as e:
-        log.error("Token refresh request failed: %s", e)
-        return auth
+        return False, f"refresh request failed: {e}", None
 
-    if r.status_code >= 400:
-        body = (r.text or "")[:500]
-        log.error("Token refresh failed (%s): %s", r.status_code, body)
+    # immer speichern fürs Debugging
+    write_json_atomic(LAST_TOKEN_RESP_PATH, {"_at": now_iso(), "http_status": r.status_code, "response": data})
 
-        # Typical invalid refresh cases
-        if "invalid_grant" in body or "refresh_token" in body or "not_found" in body:
-            log.error("Refresh token invalid/missing -> login required. Clearing tokens.")
-            auth.pop("access_token", None)
-            auth.pop("expires_at", None)
-            auth.pop("refresh_token", None)
-            save_auth(auth)
-        else:
-            # Keep refresh_token, but invalidate access token
-            auth.pop("access_token", None)
-            auth.pop("expires_at", None)
-            save_auth(auth)
+    if isinstance(data, dict) and data.get("access_token"):
+        new_tokens = dict(tokens)
+        new_tokens.update(data)
+        new_tokens["_obtained_at"] = now_iso()
+        new_tokens["_obtained_at_epoch"] = int(time.time())
+        # Manche Provider liefern refresh_token nicht jedes Mal; wenn fehlt -> altes behalten
+        if not new_tokens.get("refresh_token"):
+            new_tokens["refresh_token"] = refresh_token
+        return True, "ok", new_tokens
 
-        return auth
-
-    try:
-        tok = r.json()
-    except Exception:
-        log.error("Token refresh response not JSON: %s", (r.text or "")[:200])
-        return auth
-
-    auth["access_token"] = tok.get("access_token")
-    auth["expires_at"] = time.time() + int(tok.get("expires_in", 0) or 0)
-
-    if tok.get("refresh_token"):
-        auth["refresh_token"] = tok.get("refresh_token")
-
-    save_auth(auth)
-    log.info("Access token refreshed")
-    return auth
+    err = ""
+    if isinstance(data, dict):
+        err = data.get("error") or data.get("error_description") or ""
+    return False, f"refresh failed: {err or data}", None
 
 
-def api_get(path: str, auth: Dict[str, Any]) -> Tuple[Optional[Any], Dict[str, Any]]:
-    auth = refresh_access_token(auth)
-    token = auth.get("access_token")
-    if not token:
-        return None, auth
-
-    try:
-        r = requests.get(
-            f"{API_BASE}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=25,
-        )
-    except Exception as e:
-        log.error("API GET %s failed: %s", path, e)
-        return None, auth
-
-    if r.status_code == 401:
-        log.error("API GET %s unauthorized. Clearing access token.", path)
-        auth.pop("access_token", None)
-        auth.pop("expires_at", None)
-        save_auth(auth)
-        return None, auth
-
-    if r.status_code >= 400:
-        log.error("API GET %s failed: %s %s", path, r.status_code, (r.text or "")[:200])
-        return None, auth
-
-    try:
-        return r.json(), auth
-    except Exception:
-        log.error("API GET %s returned non-JSON: %s", path, (r.text or "")[:200])
-        return None, auth
-
-
-def ensure_home_id(auth: Dict[str, Any]) -> Dict[str, Any]:
-    if auth.get("home_id"):
-        return auth
-
-    me, auth = api_get("/me", auth)
-    if not isinstance(me, dict):
-        return auth
-
-    homes = me.get("homes")
-    if isinstance(homes, list) and homes:
-        hid = homes[0].get("id") or homes[0].get("homeId")
-        if hid:
-            auth["home_id"] = int(hid)
-            save_auth(auth)
-            log.info("Home ID detected: %s", hid)
-
-    return auth
-
-
-class MqttPublisher:
+class MqttPub:
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg
         self.client = None
-        self.connected = False
+        self.enabled = False
 
-    def enabled(self) -> bool:
-        return bool(self.cfg.get("mqtt_enabled", False) or os.getenv("MQTT_ENABLED", "false").lower() == "true")
-
-    def _host(self) -> str:
-        return str(self.cfg.get("mqtt_host") or os.getenv("MQTT_HOST", "")).strip()
-
-    def _port(self) -> int:
-        return int(self.cfg.get("mqtt_port") or os.getenv("MQTT_PORT", "1883") or 1883)
-
-    def _user(self) -> str:
-        return str(self.cfg.get("mqtt_username") or os.getenv("MQTT_USERNAME", "")).strip()
-
-    def _pass(self) -> str:
-        return str(self.cfg.get("mqtt_password") or os.getenv("MQTT_PASSWORD", "")).strip()
-
-    def discovery_prefix(self) -> str:
-        return str(self.cfg.get("mqtt_discovery_prefix") or os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant"))
-
-    def topic_prefix(self) -> str:
-        return str(self.cfg.get("mqtt_topic_prefix") or os.getenv("MQTT_TOPIC_PREFIX", "tado_assistant"))
-
-    def connect(self) -> None:
-        if not self.enabled():
+    def start(self) -> None:
+        mcfg = self.cfg.get("mqtt") or {}
+        self.enabled = bool(mcfg.get("enabled"))
+        if not self.enabled:
+            log("MQTT disabled (options.json mqtt.enabled=false)")
             return
         if mqtt is None:
-            log.error("MQTT enabled but paho-mqtt not installed")
+            log("ERROR: paho-mqtt not installed, but mqtt.enabled=true")
             return
 
-        host = self._host()
-        if not host:
-            log.error("MQTT enabled but mqtt_host/MQTT_HOST is empty")
-            return
+        host = mcfg.get("host") or "core-mosquitto"
+        port = int(mcfg.get("port") or 1883)
+        username = mcfg.get("username")
+        password = mcfg.get("password")
+        tls = bool(mcfg.get("tls", False))
 
-        self.client = mqtt.Client()
-        user = self._user()
-        if user:
-            self.client.username_pw_set(user, self._pass())
+        client_id = mcfg.get("client_id") or f"tado_assistant_{int(time.time())}"
+        c = mqtt.Client(client_id=client_id, clean_session=True)
 
+        if username:
+            c.username_pw_set(username, password=password)
+
+        if tls:
+            # default TLS settings
+            c.tls_set()
+
+        # simple log callbacks
         def on_connect(client, userdata, flags, rc):
-            self.connected = (rc == 0)
-            if self.connected:
-                log.info("MQTT connected")
-            else:
-                log.error("MQTT connect failed rc=%s", rc)
+            log(f"MQTT connected rc={rc}")
 
         def on_disconnect(client, userdata, rc):
-            self.connected = False
-            log.error("MQTT disconnected rc=%s", rc)
+            log(f"MQTT disconnected rc={rc}")
 
-        self.client.on_connect = on_connect
-        self.client.on_disconnect = on_disconnect
+        c.on_connect = on_connect
+        c.on_disconnect = on_disconnect
 
-        try:
-            self.client.connect(host, self._port(), 60)
-            self.client.loop_start()
-        except Exception as e:
-            log.error("MQTT connect error: %s", e)
-            self.client = None
-            self.connected = False
+        log(f"MQTT connecting to {host}:{port} (tls={tls}, user={'yes' if username else 'no'})")
+        c.connect(host, port, keepalive=30)
+        c.loop_start()
+        self.client = c
 
-    def publish(self, topic: str, payload: str, retain: bool = False) -> None:
-        if not (self.enabled() and self.client and self.connected):
+    def publish_json(self, topic: str, payload: Dict[str, Any], retain: bool = True) -> None:
+        if not self.client:
             return
         try:
-            self.client.publish(topic, payload, retain=retain)
+            self.client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=0, retain=retain)
         except Exception as e:
-            log.error("MQTT publish failed: %s", e)
-            self.connected = False
+            log(f"MQTT publish error: {e}")
+
+    def publish_str(self, topic: str, payload: str, retain: bool = True) -> None:
+        if not self.client:
+            return
+        try:
+            self.client.publish(topic, payload, qos=0, retain=retain)
+        except Exception as e:
+            log(f"MQTT publish error: {e}")
 
 
-def mqtt_device(home_id: int) -> Dict[str, Any]:
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any]:
+    url = f"{API_BASE}{path}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, r.text
+
+
+def ensure_valid_tokens() -> Dict[str, Any]:
+    """
+    Lädt Tokens. Wenn abgelaufen/unsicher: refresh.
+    """
+    tokens = read_json(TOKENS_PATH)
+    if not isinstance(tokens, dict):
+        raise RuntimeError(f"Tokens missing or invalid at {TOKENS_PATH}")
+
+    if token_needs_refresh(tokens):
+        ok, msg, new_tokens = refresh_tokens(tokens)
+        if ok and new_tokens:
+            write_json_atomic(TOKENS_PATH, new_tokens)
+            log("Token refreshed.")
+            return new_tokens
+        else:
+            raise RuntimeError(f"Token refresh failed: {msg}")
+
+    return tokens
+
+
+def get_home_ids(access_token: str) -> list:
+    """
+    Startpunkt: GET /me liefert u.a. homes / homeId (laut Community Spec). :contentReference[oaicite:4]{index=4}
+    """
+    status, data = api_request("GET", "/me", access_token)
+    if status != 200:
+        raise RuntimeError(f"/me failed status={status} data={data}")
+
+    home_ids = []
+    if isinstance(data, dict):
+        # unterschiedliche Formen existieren in der Wildnis:
+        # - "homes": [{"id": 123}, ...]
+        # - "homeId": 123
+        if isinstance(data.get("homes"), list):
+            for h in data["homes"]:
+                hid = h.get("id") or h.get("homeId")
+                if isinstance(hid, int):
+                    home_ids.append(hid)
+        if isinstance(data.get("homeId"), int):
+            home_ids.append(data["homeId"])
+
+    home_ids = sorted(list(set(home_ids)))
+    if not home_ids:
+        raise RuntimeError(f"No home ids found in /me response: {data}")
+    return home_ids
+
+
+def get_mobile_devices(access_token: str, home_id: int) -> list:
+    """
+    Mobile Devices für Presence.
+    Viele Clients nutzen /homes/{homeId}/mobileDevices (unofficial, aber breit verwendet).
+    """
+    status, data = api_request("GET", f"/homes/{home_id}/mobileDevices", access_token)
+    if status != 200:
+        raise RuntimeError(f"/homes/{home_id}/mobileDevices failed status={status} data={data}")
+    return data if isinstance(data, list) else []
+
+
+def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Wir versuchen 'atHome' oder ähnliche Felder robust zu finden.
+    """
+    name = device.get("name") or device.get("deviceName") or device.get("model") or "unknown"
+    dev_id = device.get("id") or device.get("deviceId") or None
+
+    at_home = None
+    # häufige Kandidaten:
+    # - device["location"]["atHome"]
+    # - device["atHome"]
+    # - device["geoTrackingEnabled"] + lastKnownLocation
+    if isinstance(device.get("location"), dict) and "atHome" in device["location"]:
+        at_home = device["location"].get("atHome")
+    elif "atHome" in device:
+        at_home = device.get("atHome")
+
+    # boolean erzwingen wenn möglich
+    if isinstance(at_home, bool):
+        state = "home" if at_home else "away"
+    else:
+        state = "unknown"
+
     return {
-        "identifiers": ["tado_assistant", str(home_id)],
-        "name": "Tado Assistant",
-        "manufacturer": "tado° (via HA Add-on)",
-        "model": "Tado Assistant",
+        "id": dev_id,
+        "name": name,
+        "state": state,
+        "at_home": at_home,
+        "raw": device,
+        "_ts": now_iso(),
     }
-
-
-def publish_discovery(pub: MqttPublisher, home_id: int, devices: List[Dict[str, Any]]) -> None:
-    dp = pub.discovery_prefix()
-    tp = pub.topic_prefix()
-
-    for d in devices:
-        dev_id = d.get("id")
-        name = d.get("name") or f"Device {dev_id}"
-        object_id = f"tado_mobile_{dev_id}"
-        unique_id = f"tado_assistant_tracker_{home_id}_{dev_id}"
-
-        state_topic = f"{tp}/home_{home_id}/mobile/{dev_id}/state"
-        cfg = {
-            "name": f"Tado {name}",
-            "uniq_id": unique_id,
-            "stat_t": state_topic,
-            "pl_home": "home",
-            "pl_not_home": "not_home",
-            "dev": mqtt_device(home_id),
-        }
-        pub.publish(f"{dp}/device_tracker/{object_id}/config", json.dumps(cfg), retain=True)
-
-    # count sensor
-    count_topic = f"{tp}/home_{home_id}/anyone_home_count/state"
-    cfg2 = {
-        "name": "Tado Anyone Home Count",
-        "uniq_id": f"tado_assistant_anyone_home_count_{home_id}",
-        "stat_t": count_topic,
-        "dev": mqtt_device(home_id),
-    }
-    pub.publish(f"{dp}/sensor/tado_anyone_home_count/config", json.dumps(cfg2), retain=True)
-
-
-def publish_states(pub: MqttPublisher, home_id: int, devices: List[Dict[str, Any]]) -> None:
-    tp = pub.topic_prefix()
-    count_home = 0
-
-    for d in devices:
-        dev_id = d.get("id")
-        loc = d.get("location") or {}
-
-        # tado uses atHome, some wrappers use at_home
-        at_home = None
-        if "atHome" in loc:
-            at_home = bool(loc.get("atHome"))
-        elif "at_home" in loc:
-            at_home = bool(loc.get("at_home"))
-
-        if at_home is None:
-            continue
-
-        if at_home:
-            count_home += 1
-
-        state = "home" if at_home else "not_home"
-        pub.publish(f"{tp}/home_{home_id}/mobile/{dev_id}/state", state, retain=True)
-
-    pub.publish(f"{tp}/home_{home_id}/anyone_home_count/state", str(count_home), retain=True)
 
 
 def main() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_options()
+    poll = int(cfg.get("poll_interval") or DEFAULT_POLL_SECONDS)
+    topic_prefix = (cfg.get("topic_prefix") or "tado_assistant").strip().strip("/")
 
-    opts = load_options()
-    poll_seconds = int(opts.get("poll_seconds", DEFAULT_POLL_SECONDS) or DEFAULT_POLL_SECONDS)
+    log(f"starting. poll_interval={poll}s tokens={TOKENS_PATH}")
+    log(f"API base: {API_BASE}")
 
-    pub = MqttPublisher(opts)
-    if pub.enabled():
-        pub.connect()
-
-    discovery_sent = False
+    mpub = MqttPub(cfg)
+    mpub.start()
 
     while True:
         try:
-            auth = load_auth()
-
-            # Not logged in yet
-            if not auth.get("refresh_token"):
-                log.info("Not authenticated yet (no refresh_token). Waiting...")
-                time.sleep(10)
+            if not tokens_exist():
+                log(f"waiting for tokens: {TOKENS_PATH} (login first)")
+                time.sleep(5)
                 continue
 
-            auth = ensure_home_id(auth)
-            home_id = auth.get("home_id")
-            if not home_id:
-                time.sleep(10)
-                continue
+            tokens = ensure_valid_tokens()
+            access_token = tokens["access_token"]
 
-            if pub.enabled() and not pub.connected:
-                pub.connect()
+            # home ids
+            home_ids = get_home_ids(access_token)
 
-            devices, auth = api_get(f"/homes/{home_id}/mobileDevices", auth)
-            if not isinstance(devices, list):
-                time.sleep(15)
-                continue
+            for home_id in home_ids:
+                # mobile devices presence
+                devices = get_mobile_devices(access_token, home_id)
+                normalized = [normalize_presence(d) for d in devices]
 
-            if pub.enabled() and pub.connected:
-                if not discovery_sent:
-                    publish_discovery(pub, int(home_id), devices)
-                    discovery_sent = True
-                publish_states(pub, int(home_id), devices)
+                # publish (optional)
+                # - aggregated
+                agg_topic = f"{topic_prefix}/presence/home_{home_id}"
+                payload = {
+                    "home_id": home_id,
+                    "devices": normalized,
+                    "_ts": now_iso(),
+                }
+                mpub.publish_json(agg_topic, payload, retain=True)
 
-            time.sleep(poll_seconds)
+                # - per device
+                for d in normalized:
+                    did = d.get("id")
+                    if did is None:
+                        continue
+                    base = f"{topic_prefix}/presence/home_{home_id}/device_{did}"
+                    mpub.publish_json(base + "/json", d, retain=True)
+                    mpub.publish_str(base + "/state", d["state"], retain=True)
+
+                log(f"presence updated home={home_id} devices={len(normalized)}")
 
         except Exception as e:
-            log.exception("Worker loop error (staying alive): %s", e)
-            time.sleep(10)
+            # Wenn 401: einmal refresh+retry beim nächsten Loop (ensure_valid_tokens macht refresh)
+            log(f"ERROR: {e}")
+
+        time.sleep(poll)
 
 
 if __name__ == "__main__":
-    log.info("worker start")
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("stopped by user")
+        sys.exit(0)
+    except Exception as e:
+        log(f"FATAL: {e}")
+        sys.exit(1)
