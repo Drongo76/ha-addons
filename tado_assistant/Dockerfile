@@ -1,24 +1,23 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
+# Pakete
 RUN apk add --no-cache \
-  python3 \
-  py3-requests \
-  py3-flask \
-  py3-gunicorn \
-  py3-paho-mqtt \
-  tzdata \
-  curl
+    python3 \
+    py3-requests \
+    py3-flask \
+    py3-gunicorn \
+    py3-paho-mqtt \
+    tzdata \
+    curl
 
-# Deine Struktur ist rootfs/ -> wird nach / kopiert:
-# - /app.py
-# - /worker.py
-# - /static/...
-# - /etc/services.d/web/run ...
+# Rootfs (enthält /app.py, /worker.py und /etc/services.d/*)
 COPY rootfs /
 
-# s6 run-scripts ausführbar machen
-RUN chmod +x /etc/services.d/web/run || true
+# s6-service scripts ausführbar machen
+RUN chmod a+x \
+    /etc/services.d/web/run \
+    /etc/services.d/worker/run
 
-# WICHTIG: kein CMD ["/init"] setzen.
-# Base Image hat ENTRYPOINT=/init, CMD bleibt leer.
+# WICHTIG:
+# KEIN CMD setzen. Base Image startet /init als ENTRYPOINT und startet s6-services automatisch.
