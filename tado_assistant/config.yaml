@@ -21,47 +21,5 @@ ingress_entry: /
 
 webui: "http://[HOST]:[PORT:8099]/"
 
-ports:
-  8099/tcp: 8099
-ports_description:
-  8099/tcp: "Web UI (Ingress)"
-
-# Dateizugriffe (für Token speichern etc.)
 map:
-  - config:rw
-  - share:rw
-  - ssl:rw
-
-# Standard: keine Spezialrechte
-host_network: false
-homeassistant_api: false
-hassio_api: false
-hassio_role: default
-docker_api: false
-full_access: false
-privileged: []
-devices: []
-usb: false
-uart: false
-gpio: false
-
-# Add-on Optionen (optional, aber sauber)
-options:
-  poll_seconds: 30
-  mqtt_enabled: false
-  mqtt_host: ""
-  mqtt_port: 1883
-  mqtt_username: ""
-  mqtt_password: ""
-  mqtt_topic_prefix: "tado_assistant"
-  mqtt_discovery_prefix: "homeassistant"
-
-schema:
-  poll_seconds: int(5,3600)
-  mqtt_enabled: bool
-  mqtt_host: str?
-  mqtt_port: int(1,65535)
-  mqtt_username: str?
-  mqtt_password: password?
-  mqtt_topic_prefix: str?
-  mqtt_discovery_prefix: str?
+  - data:rw
