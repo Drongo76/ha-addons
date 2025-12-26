@@ -1,13 +1,23 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import os
+from flask import Flask, redirect, url_for
 
-PORT = int(os.getenv("PORT", "8099"))
+app = Flask(__name__)
 
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"NO-FLASK OK")
+@app.get("/")
+def index():
+    # Minimal-Startseite (Ingress Test)
+    return """
+    <html>
+      <body>
+        <h1>Tado Assistant (Ingress)</h1>
+        <p>Web läuft über Gunicorn (kein Debug/Reloader).</p>
+        <form method="post" action="/auth/start">
+          <button type="submit">Auth Start (Dummy)</button>
+        </form>
+      </body>
+    </html>
+    """
 
-print("NO-FLASK APP STARTED")
-HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+@app.post("/auth/start")
+def auth_start():
+    # Nur Test: zurück zur Startseite
+    return redirect(url_for("index"), code=302)
