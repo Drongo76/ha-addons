@@ -1,8 +1,7 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-RUN apk add --no-cache \
-    python3 py3-requests py3-flask py3-gunicorn tzdata curl
+RUN apk add --no-cache python3 py3-requests py3-paho-mqtt tzdata curl
 
 COPY rootfs /
 RUN chmod a+x /run.sh
