@@ -15,5 +15,5 @@ COPY rootfs /
 # s6 service scripts executable machen
 RUN chmod +x /etc/services.d/web/run
 
-# s6 als PID1 (wichtig!)
-CMD ["/init"]
+# WICHTIG: /init NICHT als CMD setzen
+# (Base Image startet /init als ENTRYPOINT)
