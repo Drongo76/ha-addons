@@ -1,19 +1,17 @@
 #!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-# Log-Level aus Add-on Konfiguration
-export LOG_LEVEL="$(bashio::config 'log_level' 2>/dev/null || echo info)"
+# Marker: wenn du das NICHT im Log siehst, läuft nicht dein aktuelles Image!
+echo "### TADO-ASSISTANT run.sh LOADED (v0.2.6) ###"
 
-# WICHTIG: Flask Debug/ReLoader MUSS aus sein, sonst beendet sich PID1 (Restart-Loop).
+# Flask Debug/Reload MUSS aus (sonst: Restarting with stat + s6 loop)
 export FLASK_ENV="production"
 export FLASK_DEBUG="0"
 
-# Ingress-Port (optional über ENV überschreibbar)
+export LOG_LEVEL="$(bashio::config 'log_level' 2>/dev/null || echo info)"
 export PORT="${PORT:-8099}"
 
-echo "[tado-assistant] run.sh: LOG_LEVEL=${LOG_LEVEL} PORT=${PORT} FLASK_ENV=${FLASK_ENV} FLASK_DEBUG=${FLASK_DEBUG}"
-
-# Worker im Hintergrund starten (MQTT / Polling / Updates)
+# Worker im Hintergrund (optional)
 python3 /worker.py &
 WORKER_PID=$!
 
@@ -23,5 +21,5 @@ _term() {
 }
 trap _term TERM INT
 
-# Web-UI (Ingress) im Vordergrund starten
+# UI im Vordergrund
 exec python3 /app.py
