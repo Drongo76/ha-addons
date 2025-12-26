@@ -3,16 +3,16 @@ FROM ${BUILD_FROM}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Basis-Tools + Python (für app/worker)
+# Python + benötigte Libraries (Flask UI, Requests API, optional MQTT)
 RUN apk add --no-cache \
     python3 \
-    py3-pip \
-    py3-setuptools \
-    py3-wheel \
+    py3-requests \
+    py3-flask \
+    py3-paho-mqtt \
     tzdata \
     curl
 
-# Add-on rootfs (run.sh, app.py/worker.py, s6/cont-init.d falls vorhanden)
+# Add-on rootfs (run.sh, app.py/worker.py)
 COPY rootfs /
 
 # run.sh ausführbar machen
