@@ -8,15 +8,14 @@ export FLASK_ENV=production
 export FLASK_DEBUG=0
 export WERKZEUG_DEBUG_PIN=off
 
-# WICHTIG: Damit /app.py als Modul "app" gefunden wird
-export PYTHONPATH="/"
-
 echo "[web] starting gunicorn on :${PORT}"
 
+# WICHTIG: Lade WSGI aus Datei /app.py (nicht als Modul "app")
 exec gunicorn \
   --bind "0.0.0.0:${PORT}" \
   --workers 1 \
   --threads 8 \
   --access-logfile - \
   --error-logfile - \
-  "app:app"
+  "app:app" \
+  --chdir /
