@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -8,7 +9,7 @@ from flask import Flask, redirect, request
 
 app = Flask(__name__)
 
-# Tado Device Code Flow (offiziell)
+# tado Device Code Flow (offiziell)
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 DEVICE_AUTHORIZE_URL = "https://login.tado.com/oauth2/device_authorize"
 TOKEN_URL = "https://login.tado.com/oauth2/token"
@@ -53,27 +54,28 @@ def _back():
 
 
 def _add_query_params(url: str, extra: dict) -> str:
-    """Fügt Query-Parameter hinzu/überschreibt sie (Ingress-unabhängig)."""
     p = urlparse(url)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
-    for k, v in extra.items():
-        if v is None:
-            continue
-        q[k] = v
+    q.update({k: v for k, v in extra.items() if v is not None})
     new_query = urlencode(q)
     return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
 
 
 def _make_login_link(flow: dict) -> str:
-    """
-    Baut immer einen funktionierenden Link:
-    - wenn verification_uri_complete fehlt oder unvollständig ist -> ergänzen wir client_id
-    - user_code wird ebenfalls sicher gesetzt
-    """
+    # tado liefert normalerweise verification_uri_complete mit user_code
     base = flow.get("verification_uri_complete") or flow.get("verification_uri") or "https://login.tado.com/oauth2/device"
     user_code = flow.get("user_code", "")
-    # Tado will hier client_id sehen:
+    # Manche Installationen meckern ohne client_id → wir hängen ihn dazu
     return _add_query_params(base, {"user_code": user_code, "client_id": TADO_CLIENT_ID})
+
+
+def _flow_seconds_left(flow: dict) -> int:
+    created = int(flow.get("_created_at_epoch", 0))
+    expires = int(flow.get("expires_in", 0))
+    if not created or not expires:
+        return 0
+    left = (created + expires) - int(time.time())
+    return max(0, left)
 
 
 def _html_page(title: str, body: str) -> str:
@@ -111,7 +113,7 @@ def index():
     tokens = _read_json(TOKEN_FILE)
     flow = _read_json(FLOW_FILE)
 
-    # Wichtig für Ingress: Form actions relativ (ohne führendes "/")
+    # Ingress: Form actions RELATIV (ohne führendes "/")
     if tokens and tokens.get("refresh_token"):
         body = """
         <p class="ok">✅ Eingeloggt</p>
@@ -125,15 +127,38 @@ def index():
         return _html_page("Tado Assistant (Ingress)", body)
 
     if flow and flow.get("device_code"):
+        left = _flow_seconds_left(flow)
+        if left <= 0:
+            body = """
+            <p class="error">⏱️ Code abgelaufen (bei tado meist nach ~5 Minuten).</p>
+            <div class="row">
+              <form method="post" action="auth/start">
+                <button type="submit">Neuen Code erzeugen</button>
+              </form>
+            </div>
+            <div class="row">
+              <form method="post" action="auth/reset">
+                <button type="submit" class="secondary">Flow zurücksetzen</button>
+              </form>
+            </div>
+            """
+            return _html_page("Tado Assistant (Ingress)", body)
+
         link = _make_login_link(flow)
         code = flow.get("user_code", "")
         body = f"""
         <p>🔐 Login läuft. Öffne den Link und bestätige.</p>
+        <p class="muted">Gültig noch: <b>{left}</b> Sekunden</p>
         <p><a class="button" href="{link}" target="_blank" rel="noreferrer">Tado Login öffnen</a></p>
         <p>Code: <span class="mono"><b>{code}</b></span></p>
         <div class="row">
           <form method="post" action="auth/poll">
             <button type="submit">Ich habe bestätigt → Token holen</button>
+          </form>
+        </div>
+        <div class="row">
+          <form method="post" action="auth/start">
+            <button type="submit" class="secondary">Neuen Code erzeugen</button>
           </form>
         </div>
         <div class="row">
@@ -145,7 +170,7 @@ def index():
         return _html_page("Tado Assistant (Ingress)", body)
 
     body = """
-    <p>Starte den offiziellen Tado Device-Code Login.</p>
+    <p>Starte den offiziellen tado Device-Code Login.</p>
     <div class="row">
       <form method="post" action="auth/start">
         <button type="submit">Tado Login starten</button>
@@ -157,11 +182,14 @@ def index():
 
 @app.post("/auth/start")
 def auth_start():
-    # WICHTIG: Tado erwartet das als FORM BODY, nicht als Query params
+    # immer frischen Code erzeugen
+    _delete_file(FLOW_FILE)
+
+    # gemäß tado-Anleitung: POST + params
     try:
         r = requests.post(
             DEVICE_AUTHORIZE_URL,
-            data={"client_id": TADO_CLIENT_ID, "scope": "offline_access"},
+            params={"client_id": TADO_CLIENT_ID, "scope": "offline_access"},
             timeout=20,
         )
         data = r.json()
@@ -172,6 +200,7 @@ def auth_start():
         return _html_page("Fehler", f'<p class="error">Unerwartete Antwort: {data}</p>')
 
     data["_created_at"] = _now_iso()
+    data["_created_at_epoch"] = int(time.time())
     _write_json(FLOW_FILE, data)
     return redirect(_back(), code=303)
 
@@ -182,13 +211,16 @@ def auth_poll():
     if not flow or "device_code" not in flow:
         return redirect(_back(), code=303)
 
+    if _flow_seconds_left(flow) <= 0:
+        return redirect(_back(), code=303)
+
     device_code = flow["device_code"]
     interval = int(flow.get("interval", 5))
 
     try:
         r = requests.post(
             TOKEN_URL,
-            data={
+            params={
                 "client_id": TADO_CLIENT_ID,
                 "device_code": device_code,
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
