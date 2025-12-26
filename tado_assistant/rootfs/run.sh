@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-echo "[INFO] START MARKER PID1-FIX"
+echo "[INFO] PID1-ENTRYPOINT MARKER 2025-12-26"
 
-# Starte DEINEN Server (egal ob Flask oder http.server)
+export PYTHONUNBUFFERED=1
+export PORT="${PORT:-8099}"
+
 exec python3 -u /app.py
