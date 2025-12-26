@@ -1,7 +1,7 @@
 name: "Tado Assistant (Ingress)"
-version: "0.2.8"
+version: "0.3.0"
 slug: tado_assistant
-description: "Tado Auto-Assist Alternative als HA Add-on mit Ingress UI + MQTT presence entities."
+description: "Tado Assistant"
 arch:
   - amd64
   - aarch64
@@ -14,24 +14,9 @@ boot: auto
 
 ingress: true
 ingress_port: 8099
-panel_title: "Tado Assistant"
-panel_icon: "mdi:thermostat"
+ingress_entry: /
+
+webui: "http://[HOST]:[PORT:8099]/"
 
 map:
   - data:rw
-
-options:
-  log_level: info
-  mqtt_enable: false
-  mqtt_host: "192.168.1.10"
-  mqtt_port: 1883
-  mqtt_username: ""
-  mqtt_password: ""
-
-schema:
-  log_level: list(trace|debug|info|warning|error)
-  mqtt_enable: bool
-  mqtt_host: str
-  mqtt_port: int
-  mqtt_username: str?
-  mqtt_password: password?
