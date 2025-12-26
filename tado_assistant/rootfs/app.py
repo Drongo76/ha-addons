@@ -1,14 +1,13 @@
 import json
 import os
-import time
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, redirect, request
+from flask import Flask, redirect, url_for
 
 app = Flask(__name__)
 
-# Tado Device Code Flow (offiziell)
+# Tado Device Code Flow
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 DEVICE_AUTHORIZE_URL = "https://login.tado.com/oauth2/device_authorize"
 TOKEN_URL = "https://login.tado.com/oauth2/token"
@@ -82,12 +81,13 @@ def index():
     tokens = _read_json(TOKEN_FILE)
     flow = _read_json(FLOW_FILE)
 
+    # WICHTIG für Ingress: alle Actions/Links RELATIV (ohne führendes "/")
     if tokens and tokens.get("refresh_token"):
-        body = f"""
+        body = """
         <p class="ok">✅ Eingeloggt</p>
         <p class="muted">Token gespeichert in <code>/data/tado_tokens.json</code></p>
         <div class="row">
-          <form method="post" action="/auth/logout">
+          <form method="post" action="auth/logout">
             <button type="submit" class="secondary">Logout (Tokens löschen)</button>
           </form>
         </div>
@@ -95,17 +95,19 @@ def index():
         return _html_page("Tado Assistant (Ingress)", body)
 
     if flow and flow.get("verification_uri_complete"):
+        link = flow["verification_uri_complete"]
+        code = flow.get("user_code", "")
         body = f"""
         <p>🔐 Login läuft bereits. Öffne den Link auf Handy/PC und bestätige.</p>
-        <p><a class="button" href="{flow["verification_uri_complete"]}" target="_blank" rel="noreferrer">Tado Login öffnen</a></p>
-        <p>Code: <span class="mono"><b>{flow.get("user_code","")}</b></span></p>
+        <p><a class="button" href="{link}" target="_blank" rel="noreferrer">Tado Login öffnen</a></p>
+        <p>Code: <span class="mono"><b>{code}</b></span></p>
         <div class="row">
-          <form method="post" action="/auth/poll">
+          <form method="post" action="auth/poll">
             <button type="submit">Ich habe bestätigt → Token holen</button>
           </form>
         </div>
         <div class="row">
-          <form method="post" action="/auth/reset">
+          <form method="post" action="auth/reset">
             <button type="submit" class="secondary">Flow zurücksetzen</button>
           </form>
         </div>
@@ -115,7 +117,7 @@ def index():
     body = """
     <p>Starte den offiziellen Tado Device-Code Login.</p>
     <div class="row">
-      <form method="post" action="/auth/start">
+      <form method="post" action="auth/start">
         <button type="submit">Tado Login starten</button>
       </form>
     </div>
@@ -125,7 +127,6 @@ def index():
 
 @app.post("/auth/start")
 def auth_start():
-    # Device Authorize
     try:
         r = requests.post(
             DEVICE_AUTHORIZE_URL,
@@ -141,19 +142,20 @@ def auth_start():
 
     data["_created_at"] = _now_iso()
     _write_json(FLOW_FILE, data)
-    return redirect("/", code=302)
+
+    # Ingress-sicher: relativ zurück zur Startseite
+    return redirect("./", code=302)
 
 
 @app.post("/auth/poll")
 def auth_poll():
     flow = _read_json(FLOW_FILE)
     if not flow or "device_code" not in flow:
-        return redirect("/", code=302)
+        return redirect("./", code=302)
 
     device_code = flow["device_code"]
     interval = int(flow.get("interval", 5))
 
-    # Ein Poll-Versuch (kein Endlos-Poll im Webrequest)
     try:
         r = requests.post(
             TOKEN_URL,
@@ -168,17 +170,12 @@ def auth_poll():
     except Exception as e:
         return _html_page("Fehler", f'<p class="error">Token-Request fehlgeschlagen: {e}</p>')
 
-    # Erfolg
     if isinstance(data, dict) and data.get("access_token"):
-        tokens = {
-            **data,
-            "_obtained_at": _now_iso(),
-        }
+        tokens = {**data, "_obtained_at": _now_iso()}
         _write_json(TOKEN_FILE, tokens)
         _delete_file(FLOW_FILE)
-        return redirect("/", code=302)
+        return redirect("./", code=302)
 
-    # Noch nicht bestätigt / Fehler
     err = ""
     if isinstance(data, dict):
         err = data.get("error", "") or data.get("error_description", "")
@@ -188,12 +185,12 @@ def auth_poll():
     <p class="error">Noch kein Token: <span class="mono">{err}</span></p>
     <p class="muted">Tipp: Wenn du den Login gerade erst bestätigt hast, warte {interval} Sekunden und klicke nochmal.</p>
     <div class="row">
-      <form method="post" action="/auth/poll">
+      <form method="post" action="poll">
         <button type="submit">Nochmal Token holen</button>
       </form>
     </div>
     <div class="row">
-      <a class="button secondary" href="/" >Zurück</a>
+      <a class="button secondary" href="./">Zurück</a>
     </div>
     """
     return _html_page("Tado Login Status", hint)
@@ -202,11 +199,11 @@ def auth_poll():
 @app.post("/auth/reset")
 def auth_reset():
     _delete_file(FLOW_FILE)
-    return redirect("/", code=302)
+    return redirect("./", code=302)
 
 
 @app.post("/auth/logout")
 def auth_logout():
     _delete_file(TOKEN_FILE)
     _delete_file(FLOW_FILE)
-    return redirect("/", code=302)
+    return redirect("./", code=302)
