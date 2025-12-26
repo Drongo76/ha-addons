@@ -1,0 +1,9 @@
+#!/command/with-contenv sh
+set -eu
+
+echo "[worker] starting..."
+echo "[worker] tokens: /data/tado_assistant_tokens.json"
+
+export PYTHONPATH=/
+
+exec python3 /worker.py
