@@ -1,11 +1,13 @@
 #!/bin/sh
 set -eu
 
-export PORT="${PORT:-8099}"
-export FLASK_ENV=production
-export FLASK_DEBUG=0
-export WERKZEUG_DEBUG_PIN=off
+echo "[INFO] Starting Tado Assistant (no Flask) MARKER 2025-12-26-NOFLASK"
 
-exec gunicorn -b 0.0.0.0:${PORT} "app:app" \
-  --workers 1 --threads 8 \
-  --access-logfile - --error-logfile -
+export PYTHONUNBUFFERED=1
+export PORT="${PORT:-8099}"
+
+# Worker im Hintergrund (crash-resistent machen wir gleich)
+python3 -u /worker.py &
+
+# API/Ingress Server im Vordergrund (PID1)
+exec python3 -u /server.py
