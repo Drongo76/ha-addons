@@ -7,19 +7,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import requests
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, redirect, render_template_string, url_for
 
 APP_NAME = "Tado Assistant (Ingress)"
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 TOKENS_PATH = os.path.join(DATA_DIR, "tado_tokens.json")
 
 # Tado OAuth (Device Code Flow)
-# Du kannst das über ENV überschreiben, falls du es anders brauchst.
-TADO_DEVICE_CODE_URL = os.getenv(
-    "TADO_DEVICE_CODE_URL", "https://auth.tado.com/oauth/device_authorize"
-)
+TADO_DEVICE_CODE_URL = os.getenv("TADO_DEVICE_CODE_URL", "https://auth.tado.com/oauth/device_authorize")
 TADO_TOKEN_URL = os.getenv("TADO_TOKEN_URL", "https://auth.tado.com/oauth/token")
-TADO_CLIENT_ID = os.getenv("TADO_CLIENT_ID", "tado-web-app")  # häufig genutzter Client
+TADO_CLIENT_ID = os.getenv("TADO_CLIENT_ID", "tado-web-app")
 TADO_SCOPE = os.getenv("TADO_SCOPE", "offline_access")
 
 # Flask
@@ -30,7 +27,7 @@ _log_level = os.getenv("LOG_LEVEL", "info").upper()
 logging.basicConfig(level=getattr(logging, _log_level, logging.INFO))
 log = logging.getLogger("tado-assistant-ui")
 
-# Ingress/Web Port
+# Port (Ingress)
 PORT = int(os.getenv("PORT", "8099") or "8099")
 
 # In-memory state for ongoing device flow
@@ -66,19 +63,13 @@ def _delete_tokens() -> None:
 
 
 def _token_is_valid(tokens: Dict[str, Any]) -> bool:
-    # We store expires_at as ISO or epoch; accept both
     expires_at = tokens.get("expires_at")
     if not expires_at:
         return False
-
     try:
-        if isinstance(expires_at, (int, float)):
-            dt = datetime.fromtimestamp(float(expires_at), tz=timezone.utc)
-        else:
-            dt = datetime.fromisoformat(str(expires_at))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        # give a small safety window
+        dt = datetime.fromisoformat(str(expires_at))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt > datetime.now(timezone.utc) + timedelta(seconds=30)
     except Exception:
         return False
@@ -89,39 +80,26 @@ def _human_dt(tokens: Dict[str, Any]) -> str:
     if not expires_at:
         return "-"
     try:
-        if isinstance(expires_at, (int, float)):
-            dt = datetime.fromtimestamp(float(expires_at), tz=timezone.utc)
-        else:
-            dt = datetime.fromisoformat(str(expires_at))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(str(expires_at))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         return str(expires_at)
 
 
 def _start_device_code_flow() -> Dict[str, Any]:
-    """
-    Calls Tado device_authorize endpoint.
-    Returns dict with device_code/user_code/verification_uri/_complete/interval/expires_in
-    """
-    payload = {
-        "client_id": TADO_CLIENT_ID,
-        "scope": TADO_SCOPE,
-    }
-
+    payload = {"client_id": TADO_CLIENT_ID, "scope": TADO_SCOPE}
     log.info("Starting device code flow against %s", TADO_DEVICE_CODE_URL)
     r = requests.post(TADO_DEVICE_CODE_URL, data=payload, timeout=20)
     r.raise_for_status()
     data = r.json()
 
-    # normalize some fields
     interval = int(data.get("interval", 5))
     expires_in = int(data.get("expires_in", 600))
     data["interval"] = interval
     data["expires_in"] = expires_in
 
-    # keep state for polling
     _device_flow_state.clear()
     _device_flow_state.update(
         {
@@ -136,24 +114,16 @@ def _start_device_code_flow() -> Dict[str, Any]:
 
 
 def _poll_device_code_for_token() -> Dict[str, Any]:
-    """
-    Polls token endpoint once.
-    On success, returns token payload and saves it to /data.
-    On pending/slow_down, returns {"status": "..."}.
-    On errors, returns {"error": "...", "detail": "..."}.
-    """
     device_code = _device_flow_state.get("device_code")
     if not device_code:
         return {"error": "no_device_flow", "detail": "Device-Code Flow wurde nicht gestartet."}
 
-    # enforce polling interval (avoid hammering)
     interval = int(_device_flow_state.get("interval", 5))
     now = time.time()
     last = float(_device_flow_state.get("last_poll_at", 0.0))
     if now - last < max(1, interval):
         return {"status": "wait", "detail": f"Bitte warten (Interval {interval}s)."}
 
-    # check expiry
     started_at = float(_device_flow_state.get("started_at", now))
     expires_in = int(_device_flow_state.get("expires_in", 600))
     if now - started_at > expires_in:
@@ -169,15 +139,12 @@ def _poll_device_code_for_token() -> Dict[str, Any]:
     }
 
     r = requests.post(TADO_TOKEN_URL, data=payload, timeout=20)
-
-    # Tado returns 400 with json error for pending etc.
     try:
         data = r.json()
     except Exception:
         data = {"raw": r.text}
 
-    if r.status_code == 200 and "access_token" in data:
-        # compute expires_at
+    if r.status_code == 200 and isinstance(data, dict) and "access_token" in data:
         expires_in_token = int(data.get("expires_in", 0) or 0)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_token)
 
@@ -194,7 +161,6 @@ def _poll_device_code_for_token() -> Dict[str, Any]:
         _device_flow_state.clear()
         return {"status": "ok", "detail": "Token erhalten und gespeichert.", "tokens_saved": True}
 
-    # Handle known device flow errors
     err = data.get("error") if isinstance(data, dict) else None
     if err in ("authorization_pending", "slow_down"):
         return {"status": err, "detail": "Noch nicht bestätigt. Bitte in Tado freigeben."}
@@ -231,7 +197,7 @@ PAGE = """
 </head>
 <body>
   <h2>{{ title }}</h2>
-  <div class="muted">Ingress UI für Login/Status. Tokens werden in <span class="mono">{{ tokens_path }}</span> gespeichert.</div>
+  <div class="muted">Tokens werden in <span class="mono">{{ tokens_path }}</span> gespeichert.</div>
 
   <div class="card">
     <h3>Status</h3>
@@ -264,7 +230,7 @@ PAGE = """
     {% if flow %}
       <hr>
       <div><b>User Code:</b> <span class="mono">{{ flow.user_code }}</span></div>
-      <div class="muted">Öffne Link und bestätige: </div>
+      <div class="muted">Öffne Link und bestätige:</div>
       {% if flow.verification_uri_complete %}
         <div><a href="{{ flow.verification_uri_complete }}">{{ flow.verification_uri_complete }}</a></div>
       {% else %}
@@ -278,16 +244,11 @@ PAGE = """
       <pre>{{ message }}</pre>
     {% endif %}
   </div>
-
-  <div class="card">
-    <h3>Hinweis</h3>
-    <div class="muted">
-      Der Worker liest MQTT-Host/User/Pass aus Add-on Optionen (über run.sh → ENV). Keine Passwörter im Repo.
-    </div>
-  </div>
 </body>
 </html>
 """
+
+from flask import render_template_string  # noqa: E402
 
 
 @app.get("/")
@@ -308,60 +269,34 @@ def index():
 
 @app.post("/auth/start")
 def auth_start():
-    try:
-        flow = _start_device_code_flow()
-        return render_template_string(
-            PAGE,
-            title=APP_NAME,
-            tokens=_load_tokens(),
-            token_valid=False if not _load_tokens() else _token_is_valid(_load_tokens()),
-            expires_at=_human_dt(_load_tokens() or {}) if _load_tokens() else "-",
-            flow=flow,
-            message="Device Code Flow gestartet. Öffne den Link und bestätige in Tado. Danach auf 'Token abrufen (poll)'.",
-            tokens_path=TOKENS_PATH,
-        )
-    except Exception as e:
-        log.exception("auth_start failed")
-        return render_template_string(
-            PAGE,
-            title=APP_NAME,
-            tokens=_load_tokens(),
-            token_valid=False if not _load_tokens() else _token_is_valid(_load_tokens()),
-            expires_at=_human_dt(_load_tokens() or {}) if _load_tokens() else "-",
-            flow=None,
-            message=f"Fehler beim Starten des Device Flows: {e}",
-            tokens_path=TOKENS_PATH,
-        ), 500
+    flow = _start_device_code_flow()
+    tokens = _load_tokens()
+    return render_template_string(
+        PAGE,
+        title=APP_NAME,
+        tokens=tokens,
+        token_valid=bool(tokens and _token_is_valid(tokens)),
+        expires_at=_human_dt(tokens) if tokens else "-",
+        flow=flow,
+        message="Device Code Flow gestartet. Öffne den Link und bestätige in Tado. Danach auf 'Token abrufen (poll)'.",
+        tokens_path=TOKENS_PATH,
+    )
 
 
 @app.post("/auth/poll")
 def auth_poll():
-    try:
-        res = _poll_device_code_for_token()
-        msg = json.dumps(res, indent=2, ensure_ascii=False)
-        tokens = _load_tokens()
-        return render_template_string(
-            PAGE,
-            title=APP_NAME,
-            tokens=tokens,
-            token_valid=bool(tokens and _token_is_valid(tokens)),
-            expires_at=_human_dt(tokens) if tokens else "-",
-            flow=None,
-            message=msg,
-            tokens_path=TOKENS_PATH,
-        )
-    except Exception as e:
-        log.exception("auth_poll failed")
-        return render_template_string(
-            PAGE,
-            title=APP_NAME,
-            tokens=_load_tokens(),
-            token_valid=False if not _load_tokens() else _token_is_valid(_load_tokens()),
-            expires_at=_human_dt(_load_tokens() or {}) if _load_tokens() else "-",
-            flow=None,
-            message=f"Fehler beim Polling: {e}",
-            tokens_path=TOKENS_PATH,
-        ), 500
+    res = _poll_device_code_for_token()
+    tokens = _load_tokens()
+    return render_template_string(
+        PAGE,
+        title=APP_NAME,
+        tokens=tokens,
+        token_valid=bool(tokens and _token_is_valid(tokens)),
+        expires_at=_human_dt(tokens) if tokens else "-",
+        flow=None,
+        message=json.dumps(res, indent=2, ensure_ascii=False),
+        tokens_path=TOKENS_PATH,
+    )
 
 
 @app.post("/logout")
@@ -371,8 +306,14 @@ def logout():
     return redirect(url_for("index"))
 
 
-# ---- WICHTIG: fehlendes Ende / Server-Start ----
 if __name__ == "__main__":
-    log.info("Starting %s on 0.0.0.0:%s", APP_NAME, PORT)
-    # Ingress proxied → muss 0.0.0.0 sein
-    app.run(host="0.0.0.0", port=PORT)
+    # HART: Debug/ReLoader AUS (sonst Restart-Loop unter s6-overlay)
+    os.environ.pop("FLASK_DEBUG", None)
+    os.environ.pop("FLASK_ENV", None)
+
+    app.config["ENV"] = "production"
+    app.config["DEBUG"] = False
+    app.config["TESTING"] = False
+
+    log.info("Starting %s on 0.0.0.0:%s (debug/reloader OFF)", APP_NAME, PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
