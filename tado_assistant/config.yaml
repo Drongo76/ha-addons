@@ -1,7 +1,6 @@
 name: "Tado Assistant (Ingress)"
-description: "Tado Assistant mit Ingress UI, Device-Code-Login, Worker + optional MQTT"
 version: "0.3.7"
-slug: "tado_assistant"
+slug: tado_assistant
 description: "Tado Assistant"
 arch:
   - amd64
