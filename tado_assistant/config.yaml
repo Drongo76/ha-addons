@@ -1,6 +1,6 @@
 name: "Tado Assistant (Ingress)"
 description: "Tado Assistant mit Ingress UI, Device-Code-Login, Worker + optional MQTT"
-version: "0.4.1"
+version: "0.3.7"
 slug: "tado_assistant"
 url: "https://github.com/Drongo76/ha-addons"
 arch:
