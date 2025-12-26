@@ -1,15 +1,9 @@
-ARG BUILD_FROM
+ARG BUILD_FROM=ghcr.io/hassio-addons/base-python:3.11
 FROM ${BUILD_FROM}
 
-RUN apk add --no-cache \
-  bash \
-  ca-certificates \
-  python3 \
-  py3-flask \
-  py3-requests \
-  py3-paho-mqtt
+RUN pip install --no-cache-dir flask requests waitress paho-mqtt
 
-COPY rootfs/ /
-RUN chmod +x /run.sh
+COPY rootfs /
+RUN chmod a+x /run.sh
 
-CMD ["/run.sh"]
+CMD [ "/run.sh" ]
