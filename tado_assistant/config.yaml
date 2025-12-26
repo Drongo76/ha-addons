@@ -1,7 +1,8 @@
 name: "Tado Assistant (Ingress)"
-version: "0.3.8"
+version: "0.4.2"
 slug: tado_assistant
 description: "Tado Assistant"
+
 arch:
   - amd64
   - aarch64
@@ -9,36 +10,27 @@ arch:
   - armhf
   - i386
 
-# KRITISCH: verhindert docker --init (tini) => s6 bleibt PID1
-init: false
-
 startup: services
 boot: auto
 
+# WICHTIG: verhindert docker --init (tini) => s6 bleibt PID1
+init: false
+
 ingress: true
 ingress_port: 8099
-ingress_stream: false
+ingress_entry: /
 panel_icon: "mdi:thermostat"
 
-# Wenn du die UI auch ohne Ingress direkt öffnen willst:
-webui: "http://[HOST]:8099/"
+webui: "http://[HOST]:[PORT:8099]/"
 
-ports:
-  8099/tcp: 8099
-ports_description:
-  8099/tcp: "Web UI (Ingress)"
-
-# Dateizugriffe (für Token speichern etc.)
+# Minimal und sicher: nur /data schreiben (Tokens etc.)
 map:
-  - config:rw
-  - share:rw
-  - ssl:rw
+  - data:rw
 
-# Standard: keine Spezialrechte
+# Keine extra Rechte (sauber/standard)
 host_network: false
 homeassistant_api: false
 hassio_api: false
-hassio_role: default
 docker_api: false
 full_access: false
 privileged: []
@@ -47,7 +39,7 @@ usb: false
 uart: false
 gpio: false
 
-# Add-on Optionen (optional, aber sauber)
+# Optionen (werden nach /data/options.json gemountet)
 options:
   poll_seconds: 30
   mqtt_enabled: false
