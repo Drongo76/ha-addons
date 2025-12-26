@@ -4,8 +4,8 @@ import time
 import logging
 from pathlib import Path
 from flask import Flask, request, jsonify, Response
-
 import requests
+from werkzeug.serving import run_simple
 
 DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -13,12 +13,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AUTH_FILE = DATA_DIR / "tado_auth.json"
 DEVICE_FLOW_FILE = DATA_DIR / "device_flow.json"
 
-# Tado OAuth (Device Code Flow)
 AUTH_BASE = "https://auth.tado.com/oauth"
 DEVICE_AUTHORIZE_URL = f"{AUTH_BASE}/device_authorize"
 TOKEN_URL = f"{AUTH_BASE}/token"
 
-# Client ID wird von tado-web-app verwendet (Device Flow)
 CLIENT_ID = os.getenv("TADO_CLIENT_ID", "tado-web-app")
 SCOPE = os.getenv("TADO_SCOPE", "offline_access")
 
@@ -76,7 +74,11 @@ def html_page(body: str):
       <img src="/static/tado.svg" alt="tado" style="height:28px; opacity:.9"/>
     </div>
     """
-    return f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>{css}</head><body><div class='wrap'>{header}{body}</div></body></html>"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"{css}</head><body><div class='wrap'>{header}{body}</div></body></html>"
+    )
 
 
 @app.get("/")
@@ -113,17 +115,11 @@ def index():
 
 @app.post("/api/device/start")
 def device_start():
-    payload = {
-        "client_id": CLIENT_ID,
-        "scope": SCOPE,
-    }
+    payload = {"client_id": CLIENT_ID, "scope": SCOPE}
     r = requests.post(DEVICE_AUTHORIZE_URL, data=payload, timeout=20)
     r.raise_for_status()
     flow = r.json()
-
-    # optional: account_label vom user (nur Anzeige)
     flow["account_label"] = request.form.get("account_label", "")
-
     save_json(DEVICE_FLOW_FILE, flow)
     return jsonify(flow)
 
@@ -164,15 +160,18 @@ def device_poll():
     return jsonify({"ok": True})
 
 
-# ---- DAS fehlende Ende: Server-Start ohne Debug/ReLoader ----
 if __name__ == "__main__":
-    # HA Add-on / s6: niemals Werkzeug-ReLoader oder Debug-Fork benutzen,
-    # sonst beendet sich PID 1 und das Add-on startet in einer Schleife neu.
     os.environ["FLASK_ENV"] = "production"
     os.environ["FLASK_DEBUG"] = "0"
 
-    port = int(os.getenv("PORT", "8099") or "8099")
     host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8099") or "8099")
 
-    print(f"[tado-assistant] starting web ui on {host}:{port} (debug=False, use_reloader=False)", flush=True)
-    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+    run_simple(
+        hostname=host,
+        port=port,
+        application=app,
+        use_reloader=False,
+        use_debugger=False,
+        threaded=True,
+    )
