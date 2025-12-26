@@ -1,5 +1,5 @@
 name: "Tado Assistant (Ingress)"
-version: "0.2.4"
+version: "0.2.5"   # <-- WICHTIG: erhöhen, sonst läuft oft noch das alte Image
 slug: tado_assistant
 description: "Tado Auto-Assist Alternative als HA Add-on mit Ingress UI + MQTT presence entities."
 arch:
@@ -20,11 +20,10 @@ panel_icon: "mdi:thermostat"
 map:
   - data:rw
 
-# Defaults (werden im UI angezeigt, kannst du überschreiben)
 options:
   log_level: info
   mqtt_enable: false
-  mqtt_host: "192.168.1.10"   # <-- HIER Default-IP, bei dir anpassen oder im UI überschreiben
+  mqtt_host: "192.168.1.10"
   mqtt_port: 1883
   mqtt_username: ""
   mqtt_password: ""
@@ -32,7 +31,7 @@ options:
 schema:
   log_level: list(trace|debug|info|warning|error)
   mqtt_enable: bool
-  mqtt_host: str              # <-- Pflichtfeld, damit du IP/DNS sicher setzen kannst
+  mqtt_host: str
   mqtt_port: int
   mqtt_username: str?
   mqtt_password: password?
