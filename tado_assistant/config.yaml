@@ -17,11 +17,9 @@ boot: auto
 
 ingress: true
 ingress_port: 8099
-ingress_stream: false
-panel_icon: "mdi:thermostat"
+ingress_entry: /
 
-# Wenn du die UI auch ohne Ingress direkt öffnen willst:
-webui: "http://[HOST]:8099/"
+webui: "http://[HOST]:[PORT:8099]/"
 
 ports:
   8099/tcp: 8099
