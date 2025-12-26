@@ -1,24 +1,24 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 RUN apk add --no-cache \
-    python3 \
-    py3-requests \
-    py3-flask \
-    py3-gunicorn \
-    py3-paho-mqtt \
-    tzdata \
-    curl
+  python3 \
+  py3-requests \
+  py3-flask \
+  py3-gunicorn \
+  py3-paho-mqtt \
+  tzdata \
+  curl
 
-# s6 / services / init scripts
+# Deine Struktur ist rootfs/ -> wird nach / kopiert:
+# - /app.py
+# - /worker.py
+# - /static/...
+# - /etc/services.d/web/run ...
 COPY rootfs /
 
-# WICHTIG: App-Code liegt neben Dockerfile, also explizit mitkopieren
-COPY app.py /app.py
-COPY worker.py /worker.py
-COPY static /static
+# s6 run-scripts ausführbar machen
+RUN chmod +x /etc/services.d/web/run || true
 
-# Falls du /run.sh in rootfs nutzt:
-RUN chmod a+x /run.sh || true
+# WICHTIG: kein CMD ["/init"] setzen.
+# Base Image hat ENTRYPOINT=/init, CMD bleibt leer.
