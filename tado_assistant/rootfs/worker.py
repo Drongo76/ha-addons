@@ -35,6 +35,9 @@ HTTP_TIMEOUT = 20
 # Discovery republish (falls HA/retained mal „verschluckt“ wurde)
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
+# Wenn wir Discovery-Schema ändern, wollen wir Legacy-Entities automatisch wegräumen
+DISCOVERY_SCHEMA_VERSION = 2
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -301,19 +304,39 @@ def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
     elif "atHome" in device:
         at_home = device.get("atHome")
 
+    # WICHTIG: device_tracker erwartet typischerweise home / not_home
     if isinstance(at_home, bool):
-        state = "home" if at_home else "away"
+        state = "home" if at_home else "not_home"
     else:
         state = "unknown"
 
     return {"id": dev_id, "name": name, "state": state, "at_home": at_home, "_ts": now_iso()}
 
 
-def discovery_object_ids(ha_device_id: str, device_id: int) -> Tuple[str, str]:
-    # object_id muss stabil bleiben, sonst entstehen Duplikate
-    bin_object_id = f"{ha_device_id}_presence_{device_id}"
-    json_object_id = f"{ha_device_id}_presence_{device_id}_json"
-    return bin_object_id, json_object_id
+def discovery_device_object_ids(ha_device_id: str, home_id: int, device_id: int) -> Tuple[str, str, str, str]:
+    """
+    Neue IDs (stabil + mit home_id):
+      - tracker_object_id:   <ha>_home_<home>_device_<did>
+      - raw_object_id:       <tracker>_raw
+
+    Legacy IDs (aus deiner alten Version):
+      - legacy_bin_object_id:  <ha>_presence_<did>
+      - legacy_json_object_id: <ha>_presence_<did>_json
+    """
+    tracker_object_id = f"{ha_device_id}_home_{home_id}_device_{device_id}"
+    raw_object_id = f"{tracker_object_id}_raw"
+
+    legacy_bin_object_id = f"{ha_device_id}_presence_{device_id}"
+    legacy_json_object_id = f"{ha_device_id}_presence_{device_id}_json"
+    return tracker_object_id, raw_object_id, legacy_bin_object_id, legacy_json_object_id
+
+
+def discovery_home_object_ids(ha_device_id: str, home_id: int) -> Tuple[str, str]:
+    # Neues Ziel: sensor ...home_<id>_raw
+    home_raw_object_id = f"{ha_device_id}_home_{home_id}_raw"
+    # Legacy aus alter Version:
+    legacy_home_object_id = f"{ha_device_id}_home_{home_id}_presence"
+    return home_raw_object_id, legacy_home_object_id
 
 
 def publish_discovery_for_devices(
@@ -324,6 +347,7 @@ def publish_discovery_for_devices(
     ha_device_id: str,
     home_id: int,
     devices: list,
+    legacy_cleanup: bool = False,
 ) -> None:
     if not mpub.client:
         return
@@ -337,55 +361,76 @@ def publish_discovery_for_devices(
 
     availability_topic = f"{topic_prefix}/_status"
 
+    # 1) Pro Device: device_tracker + raw sensor
     for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
         if not did:
             continue
+        try:
+            did_i = int(did)
+        except Exception:
+            continue
 
-        bin_object_id, json_object_id = discovery_object_ids(ha_device_id, int(did))
+        tracker_object_id, raw_object_id, legacy_bin_object_id, legacy_json_object_id = discovery_device_object_ids(
+            ha_device_id, home_id, did_i
+        )
 
-        state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did}/state"
-        json_attr_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did}/json"
+        state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_i}/state"
+        json_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_i}/json"
 
-        # Binary sensor
-        bin_config_topic = f"{discovery_prefix}/binary_sensor/{bin_object_id}/config"
-        bin_payload = {
+        # Optional: Legacy retained configs entfernen (damit keine Doppel-Entities bleiben)
+        if legacy_cleanup:
+            legacy_bin_config_topic = f"{discovery_prefix}/binary_sensor/{legacy_bin_object_id}/config"
+            legacy_json_config_topic = f"{discovery_prefix}/sensor/{legacy_json_object_id}/config"
+            mpub.publish_delete_retained(legacy_bin_config_topic)
+            mpub.publish_delete_retained(legacy_json_config_topic)
+
+        # ---- device_tracker (home / not_home) ----
+        tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
+        tracker_payload = {
             "name": f"Tado Presence {name}",
-            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did}_presence",
+            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_i}_tracker",
             "state_topic": state_topic,
-            "payload_on": "home",
-            "payload_off": "away",
-            "device_class": "presence",
+            "payload_home": "home",
+            "payload_not_home": "not_home",
             "availability_topic": availability_topic,
             "payload_available": "online",
             "payload_not_available": "offline",
+            # optional: wir hängen das JSON direkt als Attributes an den device_tracker
+            "json_attributes_topic": json_topic,
             "device": device_block,
         }
-        mpub.publish_json(bin_config_topic, bin_payload, retain=True)
+        mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
-        # JSON sensor (attributes)
-        json_config_topic = f"{discovery_prefix}/sensor/{json_object_id}/config"
-        json_payload = {
+        # ---- raw sensor (JSON als Attributes, State = Timestamp) ----
+        raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
+        raw_payload = {
             "name": f"Tado Presence {name} (raw)",
-            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did}_json",
-            "state_topic": state_topic,
-            "json_attributes_topic": json_attr_topic,
+            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_i}_raw",
+            "state_topic": json_topic,
+            "value_template": "{{ value_json._ts }}",
+            "json_attributes_topic": json_topic,
             "availability_topic": availability_topic,
             "payload_available": "online",
             "payload_not_available": "offline",
             "device": device_block,
             "icon": "mdi:account",
         }
-        mpub.publish_json(json_config_topic, json_payload, retain=True)
+        mpub.publish_json(raw_config_topic, raw_payload, retain=True)
 
-    # aggregated home sensor
-    agg_object_id = f"{ha_device_id}_home_{home_id}_presence"
-    agg_config_topic = f"{discovery_prefix}/sensor/{agg_object_id}/config"
+    # 2) Home aggregated raw sensor: sensor ...home_<id>_raw
+    home_raw_object_id, legacy_home_object_id = discovery_home_object_ids(ha_device_id, home_id)
     agg_topic = f"{topic_prefix}/presence/home_{home_id}"
-    agg_payload = {
-        "name": f"Tado Presence Home {home_id}",
-        "unique_id": f"{ha_device_id}_home_{home_id}_presence_json",
+
+    if legacy_cleanup:
+        legacy_home_config_topic = f"{discovery_prefix}/sensor/{legacy_home_object_id}/config"
+        mpub.publish_delete_retained(legacy_home_config_topic)
+
+    home_raw_config_topic = f"{discovery_prefix}/sensor/{home_raw_object_id}/config"
+    home_raw_payload = {
+        "name": f"Tado Home {home_id} (raw)",
+        "unique_id": f"{ha_device_id}_home_{home_id}_raw",
         "state_topic": agg_topic,
         "value_template": "{{ value_json._ts }}",
         "json_attributes_topic": agg_topic,
@@ -395,30 +440,49 @@ def publish_discovery_for_devices(
         "device": device_block,
         "icon": "mdi:home-account",
     }
-    mpub.publish_json(agg_config_topic, agg_payload, retain=True)
+    mpub.publish_json(home_raw_config_topic, home_raw_payload, retain=True)
 
 
 def discovery_cleanup_removed_devices(
     mpub: MqttPub,
     discovery_prefix: str,
     ha_device_id: str,
+    home_id: int,
     removed_device_ids: set,
 ) -> None:
     if not mpub.client:
         return
+
     for did in sorted(list(removed_device_ids)):
-        bin_object_id, json_object_id = discovery_object_ids(ha_device_id, int(did))
-        bin_config_topic = f"{discovery_prefix}/binary_sensor/{bin_object_id}/config"
-        json_config_topic = f"{discovery_prefix}/sensor/{json_object_id}/config"
-        mpub.publish_delete_retained(bin_config_topic)
-        mpub.publish_delete_retained(json_config_topic)
-        log(f"discovery cleanup: removed device_id={did}")
+        try:
+            did_i = int(did)
+        except Exception:
+            continue
+
+        tracker_object_id, raw_object_id, legacy_bin_object_id, legacy_json_object_id = discovery_device_object_ids(
+            ha_device_id, home_id, did_i
+        )
+
+        # new
+        tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
+        raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
+        mpub.publish_delete_retained(tracker_config_topic)
+        mpub.publish_delete_retained(raw_config_topic)
+
+        # legacy
+        legacy_bin_config_topic = f"{discovery_prefix}/binary_sensor/{legacy_bin_object_id}/config"
+        legacy_json_config_topic = f"{discovery_prefix}/sensor/{legacy_json_object_id}/config"
+        mpub.publish_delete_retained(legacy_bin_config_topic)
+        mpub.publish_delete_retained(legacy_json_config_topic)
+
+        log(f"discovery cleanup: removed device_id={did_i} (home={home_id})")
 
 
 def load_discovery_state() -> Dict[str, Any]:
     st = read_json(DISCOVERY_STATE_PATH)
     if not isinstance(st, dict):
-        return {"homes": {}}
+        return {"schema_version": 1, "homes": {}}
+    st.setdefault("schema_version", 1)
     st.setdefault("homes", {})
     if not isinstance(st["homes"], dict):
         st["homes"] = {}
@@ -480,20 +544,33 @@ def main() -> None:
                     did = d.get("id")
                     if not did:
                         continue
-                    base = f"{topic_prefix}/presence/home_{home_id}/device_{did}"
+                    try:
+                        did_i = int(did)
+                    except Exception:
+                        continue
+                    base = f"{topic_prefix}/presence/home_{home_id}/device_{did_i}"
                     mpub.publish_json(base + "/json", d, retain=True)
                     mpub.publish(base + "/state", d["state"], retain=True)
 
                 # 2) Discovery + Cleanup
-                current_ids = {int(d["id"]) for d in devices if d.get("id")}
+                current_ids = set()
+                for d in devices:
+                    try:
+                        current_ids.add(int(d["id"]))
+                    except Exception:
+                        pass
+
                 prev_ids = set(discovery_state["homes"].get(str(home_id), {}).get("device_ids", []))
                 removed = prev_ids - current_ids
 
                 if mpub.client:
                     if removed:
-                        discovery_cleanup_removed_devices(mpub, discovery_prefix, ha_device_id, removed)
+                        discovery_cleanup_removed_devices(mpub, discovery_prefix, ha_device_id, home_id, removed)
 
-                    if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
+                    should_publish_discovery = (loop == 1) or (loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0)
+                    if should_publish_discovery:
+                        legacy_cleanup = int(discovery_state.get("schema_version", 1)) < DISCOVERY_SCHEMA_VERSION
+
                         publish_discovery_for_devices(
                             mpub,
                             discovery_prefix,
@@ -502,8 +579,14 @@ def main() -> None:
                             ha_device_id,
                             home_id,
                             devices,
+                            legacy_cleanup=legacy_cleanup,
                         )
                         log(f"discovery published (home={home_id}, devices={len(current_ids)})")
+
+                        if legacy_cleanup:
+                            discovery_state["schema_version"] = DISCOVERY_SCHEMA_VERSION
+                            save_discovery_state(discovery_state)
+                            log("discovery schema upgraded; legacy retained configs were cleaned up.")
 
                     discovery_state["homes"][str(home_id)] = {
                         "device_ids": sorted(list(current_ids)),
