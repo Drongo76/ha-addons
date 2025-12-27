@@ -337,7 +337,6 @@ def publish_discovery_for_devices(
 
     availability_topic = f"{topic_prefix}/_status"
 
-    # per device
     for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
@@ -380,7 +379,7 @@ def publish_discovery_for_devices(
         }
         mpub.publish_json(json_config_topic, json_payload, retain=True)
 
-    # aggregated home sensor (stabil)
+    # aggregated home sensor
     agg_object_id = f"{ha_device_id}_home_{home_id}_presence"
     agg_config_topic = f"{discovery_prefix}/sensor/{agg_object_id}/config"
     agg_topic = f"{topic_prefix}/presence/home_{home_id}"
@@ -405,20 +404,14 @@ def discovery_cleanup_removed_devices(
     ha_device_id: str,
     removed_device_ids: set,
 ) -> None:
-    """
-    Entfernte Geräte aus HA löschen: Discovery config retained = leer publishen.
-    """
     if not mpub.client:
         return
     for did in sorted(list(removed_device_ids)):
         bin_object_id, json_object_id = discovery_object_ids(ha_device_id, int(did))
-
         bin_config_topic = f"{discovery_prefix}/binary_sensor/{bin_object_id}/config"
         json_config_topic = f"{discovery_prefix}/sensor/{json_object_id}/config"
-
         mpub.publish_delete_retained(bin_config_topic)
         mpub.publish_delete_retained(json_config_topic)
-
         log(f"discovery cleanup: removed device_id={did}")
 
 
@@ -445,10 +438,11 @@ def main() -> None:
     ha_device_id = cfg["ha_device_id"]
 
     log(f"starting. poll_seconds={poll}")
+
     mpub = MqttPub(cfg["mqtt"])
     mpub.start()
 
-    # availability
+    # availability online
     if mpub.client:
         mpub.publish(f"{topic_prefix}/_status", "online", retain=True)
         log(f"status published: {topic_prefix}/_status = online")
@@ -456,6 +450,7 @@ def main() -> None:
     discovery_state = load_discovery_state()
     loop = 0
 
+    # WICHTIG: Erste Runde läuft sofort (ohne Sleep), damit HA nicht lange "unknown" bleibt
     while True:
         loop += 1
         try:
@@ -473,13 +468,14 @@ def main() -> None:
                 devices_raw = get_mobile_devices(access_token, home_id)
                 devices = [normalize_presence(d) for d in devices_raw]
 
-                # publish data
+                # 1) ZUERST state/json publishen (retained), dann Discovery (damit HA direkt Werte hat)
                 agg_topic = f"{topic_prefix}/presence/home_{home_id}"
                 mpub.publish_json(
                     agg_topic,
                     {"home_id": home_id, "devices": devices, "_ts": now_iso()},
                     retain=True,
                 )
+
                 for d in devices:
                     did = d.get("id")
                     if not did:
@@ -488,19 +484,15 @@ def main() -> None:
                     mpub.publish_json(base + "/json", d, retain=True)
                     mpub.publish(base + "/state", d["state"], retain=True)
 
-                # --- discovery + cleanup ---
+                # 2) Discovery + Cleanup
                 current_ids = {int(d["id"]) for d in devices if d.get("id")}
-                prev_ids = set(
-                    discovery_state["homes"].get(str(home_id), {}).get("device_ids", [])
-                )
+                prev_ids = set(discovery_state["homes"].get(str(home_id), {}).get("device_ids", []))
                 removed = prev_ids - current_ids
 
                 if mpub.client:
-                    # cleanup first (damit HA keine Leichen behält)
                     if removed:
                         discovery_cleanup_removed_devices(mpub, discovery_prefix, ha_device_id, removed)
 
-                    # publish discovery on first loop / every N loops
                     if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
                         publish_discovery_for_devices(
                             mpub,
@@ -513,7 +505,6 @@ def main() -> None:
                         )
                         log(f"discovery published (home={home_id}, devices={len(current_ids)})")
 
-                    # update state
                     discovery_state["homes"][str(home_id)] = {
                         "device_ids": sorted(list(current_ids)),
                         "updated_at": now_iso(),
