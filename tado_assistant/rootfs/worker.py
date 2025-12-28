@@ -502,23 +502,21 @@ def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
     object_id = "auto_assist"
     config_topic = f"{dp}/switch/{node_id}/{object_id}/config"
 
-    availability_topic = f"{tp}/_status"
 
     payload = {
         "name": "Tado Assistant Auto-Assist",
         "unique_id": f"{ha_device_id}_auto_assist",
+        "object_id": f"{ha_device_id}_auto_assist",
+        "entity_category": "config",
         "state_topic": f"{tp}/{AUTO_ASSIST_STATE_TOPIC}",
         "command_topic": f"{tp}/{AUTO_ASSIST_SET_TOPIC}",
         "payload_on": "ON",
         "payload_off": "OFF",
         "state_on": "ON",
         "state_off": "OFF",
-        "optimistic": False,
+        "optimistic": True,
         "retain": True,
 
-        "availability_topic": availability_topic,
-        "payload_available": "online",
-        "payload_not_available": "offline",
 
         "json_attributes_topic": f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
         "device": device_block,
@@ -542,6 +540,11 @@ def cleanup_old_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> Non
         f"{dp}/switch/{ha_device_id}/{ha_device_id}_auto_assist_switch/config",
         # some double-prefixed attempts
         f"{dp}/switch/{ha_device_id}_tado_assistant_auto_assist/config",
+        # hyphen variant
+        f"{dp}/switch/{ha_device_id}/auto-assist/config",
+        # other variants seen in experiments
+        f"{dp}/switch/{ha_device_id}/auto_assist_switch/config",
+        f"{dp}/switch/{ha_device_id}/tado_assistant_auto_assist/config",
     ]
     for t in old_topics:
         mpub.publish_delete_retained(t)
@@ -614,6 +617,8 @@ def publish_discovery_for_devices(
             "state_topic": agg_topic,
             "value_template": "{{ value_json._ts }}",
             "json_attributes_topic": agg_topic,
+        "entity_category": "diagnostic",
+        "enabled_by_default": False,
             "availability_topic": availability_topic,
             "payload_available": "online",
             "payload_not_available": "offline",
@@ -660,6 +665,8 @@ def publish_discovery_for_devices(
                 "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
                 "state_topic": state_topic,
                 "json_attributes_topic": raw_topic,
+        "entity_category": "diagnostic",
+        "enabled_by_default": False,
                 "availability_topic": availability_topic,
                 "payload_available": "online",
                 "payload_not_available": "offline",
@@ -798,6 +805,8 @@ def main() -> None:
 
         # Subscribe to HA commands
         mpub.subscribe(f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}")
+        # safety net: catch accidental topic variants
+        mpub.subscribe(f"{topic_prefix}/auto_assist/#")
 
         log("auto-assist: discovery+state published; command subscribed")
 
@@ -852,16 +861,9 @@ def main() -> None:
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
 
-            # Auto-Assist heartbeat metadata when enabled (real actions come next)
+            # Auto-Assist state/attrs (always republish so HA never shows it as unavailable)
             st = read_auto_assist_runtime()
-            if st.get("enabled") is True:
-                st["last_run"] = now_iso()
-                st["last_action"] = "tick"
-                st["last_error"] = None
-                write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
-                publish_auto_assist(mpub, cfg, st)
-
-            backoff_current = backoff_base
+            publish_auto_assist(mpub, cfg, st)
             time.sleep(poll)
 
         except RateLimitError as e:
