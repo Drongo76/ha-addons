@@ -23,11 +23,8 @@ TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
 LAST_DEVICES_PATH = os.path.join(DATA_DIR, "tado_assistant_last_devices.json")
 
-# Auto-Assist state (enabled toggled by HA switch)
+# Auto-Assist runtime (enabled is forced OFF on every boot)
 AUTO_ASSIST_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_auto_assist_state.json")
-
-# One-time retained cleanup marker
-CLEANUP_MARKER_PATH = os.path.join(DATA_DIR, "tado_assistant_cleanup_marker.json")
 
 API_BASE = "https://my.tado.com/api/v2"
 
@@ -43,6 +40,7 @@ DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 120
 DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS = 1800
 
+
 # Auto-Assist MQTT topics (relative to topic_prefix)
 AUTO_ASSIST_STATE_TOPIC = "auto_assist/state"   # payload: ON/OFF
 AUTO_ASSIST_SET_TOPIC = "auto_assist/set"       # payload: ON/OFF
@@ -50,7 +48,7 @@ AUTO_ASSIST_ATTRS_TOPIC = "auto_assist/attrs"   # JSON: last_run/last_action/las
 
 
 # -----------------------------
-# Helpers
+# Small helpers
 # -----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -120,7 +118,8 @@ def load_config() -> Dict[str, Any]:
         poll = DEFAULT_POLL_SECONDS
     poll = max(10, poll)
 
-    enable_raw_sensors = bool(opt.get("enable_raw_sensors", True))
+    enable_raw_sensors = opt.get("enable_raw_sensors", True)
+    enable_raw_sensors = bool(enable_raw_sensors)
 
     tado_home_ids = opt.get("tado_home_ids", opt.get("home_ids"))
     if isinstance(tado_home_ids, str):
@@ -151,11 +150,9 @@ def load_config() -> Dict[str, Any]:
     if not isinstance(mcfg, dict):
         mcfg = {}
 
-    # flat keys (support both styles)
+    # flat keys
     if "mqtt_enabled" in opt:
         mcfg["enabled"] = bool(opt.get("mqtt_enabled"))
-    mcfg.setdefault("enabled", True)
-
     if "mqtt_host" in opt:
         mcfg["host"] = opt.get("mqtt_host")
     if "mqtt_port" in opt:
@@ -178,9 +175,6 @@ def load_config() -> Dict[str, Any]:
     ha_device_name = opt.get("ha_device_name") or "Tado Assistant"
     ha_device_id = opt.get("ha_device_id") or "tado_assistant"
 
-    # Legacy cleanup: default TRUE once, can be turned off
-    cleanup_legacy = bool(opt.get("cleanup_legacy_discovery", True))
-
     return {
         "poll_seconds": poll,
         "enable_raw_sensors": enable_raw_sensors,
@@ -192,17 +186,16 @@ def load_config() -> Dict[str, Any]:
         "discovery_prefix": discovery_prefix,
         "ha_device_name": ha_device_name,
         "ha_device_id": ha_device_id,
-        "cleanup_legacy_discovery": cleanup_legacy,
         "raw": opt,
     }
 
 
 # -----------------------------
-# MQTT wrapper
+# MQTT
 # -----------------------------
 class MqttPub:
-    def __init__(self, mqtt_cfg: Dict[str, Any]) -> None:
-        self.cfg = mqtt_cfg or {}
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg or {}
         self.client = None
         self._on_message_cb: Optional[Callable[[str, str], None]] = None
         self._on_connect_cb: Optional[Callable[[], None]] = None
@@ -214,80 +207,81 @@ class MqttPub:
         self._on_connect_cb = cb
 
     def start(self, lwt_topic: Optional[str] = None) -> None:
-        enabled = bool(self.cfg.get("enabled", True))
-        if not enabled:
-            log("MQTT disabled (options.json mqtt_enabled=false)")
-            return
         if mqtt is None:
-            log("ERROR: paho-mqtt not installed, but mqtt enabled")
+            log("WARN: paho-mqtt not available, MQTT disabled")
+            return
+
+        enabled = self.cfg.get("enabled", True)
+        if not enabled:
+            log("MQTT disabled in config")
             return
 
         host = self.cfg.get("host") or "core-mosquitto"
         port = int(self.cfg.get("port") or 1883)
         username = self.cfg.get("username")
         password = self.cfg.get("password")
-        tls = bool(self.cfg.get("tls", False))
-
+        use_tls = bool(self.cfg.get("tls", False))
         client_id = self.cfg.get("client_id") or f"tado_assistant_{int(time.time())}"
-        c = mqtt.Client(client_id=client_id, clean_session=True)
 
-        # Last Will: if the add-on crashes, HA sees "offline"
+        self.client = mqtt.Client(client_id=client_id, clean_session=True)
+
         if lwt_topic:
             try:
-                c.will_set(lwt_topic, payload="offline", qos=0, retain=True)
+                self.client.will_set(lwt_topic, payload="offline", qos=0, retain=True)
             except Exception as e:
                 log(f"WARN: cannot set MQTT LWT: {e}")
 
         if username:
-            c.username_pw_set(username, password=password)
-        if tls:
+            self.client.username_pw_set(str(username), str(password or ""))
+
+        if use_tls:
             try:
-                c.tls_set()
+                self.client.tls_set()
             except Exception as e:
                 log(f"WARN: cannot enable MQTT TLS: {e}")
 
         def on_connect(client, userdata, flags, rc):
             log(f"MQTT connected rc={rc}")
-            try:
-                if self._on_connect_cb:
+            if self._on_connect_cb:
+                try:
                     self._on_connect_cb()
-            except Exception as e:
-                log(f"WARN: on_connect callback failed: {e}")
+                except Exception as e:
+                    log(f"WARN: on_connect callback failed: {e}")
 
         def on_disconnect(client, userdata, rc):
             log(f"MQTT disconnected rc={rc}")
 
         def on_message(client, userdata, msg):
             try:
-                topic = msg.topic or ""
-                payload = msg.payload.decode("utf-8", errors="ignore") if msg.payload else ""
+                t = msg.topic or ""
+                p = msg.payload.decode("utf-8", errors="ignore") if msg.payload else ""
                 if self._on_message_cb:
-                    self._on_message_cb(topic, payload)
+                    self._on_message_cb(t, p)
             except Exception:
                 pass
 
-        c.on_connect = on_connect
-        c.on_disconnect = on_disconnect
-        c.on_message = on_message
+        self.client.on_connect = on_connect
+        self.client.on_disconnect = on_disconnect
+        self.client.on_message = on_message
 
-        log(f"MQTT connecting to {host}:{port} (tls={tls}, user={'yes' if username else 'no'})")
-        c.connect(host, port, keepalive=30)
-        c.loop_start()
-        self.client = c
+        log(f"MQTT connecting to {host}:{port} (tls={use_tls}, user={'yes' if username else 'no'})")
+        self.client.connect(host, port, keepalive=60)
+        self.client.loop_start()
 
     def subscribe(self, topic: str) -> None:
-        if self.client:
-            self.client.subscribe(topic)
+        if not self.client:
+            return
+        self.client.subscribe(topic)
 
     def publish(self, topic: str, payload: str, retain: bool = True) -> None:
-        if self.client:
-            self.client.publish(topic, payload, qos=0, retain=retain)
+        if not self.client:
+            return
+        self.client.publish(topic, payload, qos=0, retain=retain)
 
     def publish_json(self, topic: str, payload: Any, retain: bool = True) -> None:
         self.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
 
     def publish_delete_retained(self, topic: str) -> None:
-        # publish empty retained payload => broker deletes retained message
         self.publish(topic, "", retain=True)
 
 
@@ -301,10 +295,10 @@ class RateLimitError(Exception):
         self.retry_after = retry_after
 
 
-def api_request(method: str, path: str, access_token: str) -> Tuple[int, Any, Dict[str, str]]:
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
     url = f"{API_BASE}{path}"
     headers = {"Authorization": f"Bearer {access_token}"}
-    r = requests.request(method, url, headers=headers, timeout=HTTP_TIMEOUT)
+    r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
     resp_headers = {k: v for k, v in r.headers.items()}
     try:
         data = r.json()
@@ -368,23 +362,30 @@ def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
         except Exception:
             pass
     s = tokens.get("_obtained_at")
-    if not s:
-        return None
-    try:
-        return int(datetime.fromisoformat(s).timestamp())
-    except Exception:
-        return None
+    if isinstance(s, str) and s:
+        try:
+            return int(datetime.fromisoformat(s).timestamp())
+        except Exception:
+            return None
+    return None
 
 
-def token_is_expired(tokens: Dict[str, Any], skew_seconds: int = 60) -> bool:
+def token_expires_at(tokens: Dict[str, Any]) -> Optional[int]:
     obtained = _obtained_epoch(tokens)
     try:
         expires_in = int(tokens.get("expires_in"))
     except Exception:
-        return True
+        return None
     if obtained is None:
+        return None
+    return obtained + expires_in
+
+
+def token_is_expired(tokens: Dict[str, Any], skew_seconds: int = 60) -> bool:
+    exp = token_expires_at(tokens)
+    if exp is None:
         return True
-    return time.time() >= (obtained + expires_in - skew_seconds)
+    return time.time() >= (exp - skew_seconds)
 
 
 def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
@@ -413,11 +414,13 @@ def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
 
     new_tokens = dict(tokens)
     new_tokens.update(data)
+
     if not new_tokens.get("refresh_token"):
         new_tokens["refresh_token"] = refresh_token
 
     new_tokens["_obtained_at"] = now_iso()
     new_tokens["_obtained_at_epoch"] = int(time.time())
+
     write_json_atomic(TOKENS_PATH, new_tokens)
     log("Token refreshed.")
     return new_tokens
@@ -427,90 +430,46 @@ def ensure_valid_tokens() -> Dict[str, Any]:
     tokens = read_json(TOKENS_PATH)
     if not isinstance(tokens, dict):
         raise RuntimeError(f"tokens file invalid: {TOKENS_PATH}")
+
     if token_is_expired(tokens):
         tokens = refresh_tokens(tokens)
     return tokens
 
 
 # -----------------------------
-# Auto-Assist: state + MQTT discovery
+# Auto-Assist runtime state + MQTT entity
 # -----------------------------
-def load_auto_assist_state(force_off_on_boot: bool = True) -> Dict[str, Any]:
+def read_auto_assist_runtime() -> Dict[str, Any]:
     st = read_json(AUTO_ASSIST_STATE_PATH)
     if not isinstance(st, dict):
         st = {}
-
-    # Always have keys
     st.setdefault("enabled", False)
     st.setdefault("last_run", None)
     st.setdefault("last_action", None)
     st.setdefault("last_error", None)
-
-    # Requirement: default OFF after restart
-    if force_off_on_boot:
-        st["enabled"] = False
-        st["last_run"] = now_iso()
-        st["last_action"] = "boot_off"
-        st["last_error"] = None
-
     return st
 
 
-def save_auto_assist_state(st: Dict[str, Any]) -> None:
+def boot_auto_assist_force_off() -> Dict[str, Any]:
+    st = read_auto_assist_runtime()
+    st["enabled"] = False
+    st["last_action"] = "boot_off"
+    st["last_error"] = None
+    st["last_run"] = now_iso()
     write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+    return st
 
 
-def publish_auto_assist_discovery(
-    mpub: MqttPub,
-    discovery_prefix: str,
-    topic_prefix: str,
-    ha_device_name: str,
-    ha_device_id: str,
-) -> None:
+def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
     if not mpub.client:
         return
 
-    device_block = {
-        "identifiers": [ha_device_id],
-        "name": ha_device_name,
-        "manufacturer": "tado°",
-        "model": "Tado Assistant (Ingress)",
-    }
-
-    object_id = f"{ha_device_id}_auto_assist"
-    config_topic = f"{discovery_prefix}/switch/{object_id}/config"
-
-    payload = {
-        "name": "Tado Assistant Auto-Assist",
-        "unique_id": f"{ha_device_id}_auto_assist_switch",
-        "state_topic": f"{topic_prefix}/{AUTO_ASSIST_STATE_TOPIC}",
-        "command_topic": f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}",
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "state_on": "ON",
-        "state_off": "OFF",
-        "optimistic": False,
-        "retain": True,
-        "availability_topic": f"{topic_prefix}/_status",
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "json_attributes_topic": f"{topic_prefix}/{AUTO_ASSIST_ATTRS_TOPIC}",
-        "device": device_block,
-        "icon": "mdi:robot",
-    }
-
-    mpub.publish_json(config_topic, payload, retain=True)
-
-
-def publish_auto_assist_state(mpub: MqttPub, topic_prefix: str, st: Dict[str, Any]) -> None:
-    if not mpub.client:
-        return
-
+    tp = cfg["topic_prefix"]
     enabled = bool(st.get("enabled"))
-    mpub.publish(f"{topic_prefix}/{AUTO_ASSIST_STATE_TOPIC}", "ON" if enabled else "OFF", retain=True)
 
+    mpub.publish(f"{tp}/{AUTO_ASSIST_STATE_TOPIC}", "ON" if enabled else "OFF", retain=True)
     mpub.publish_json(
-        f"{topic_prefix}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
         {
             "enabled": enabled,
             "last_run": st.get("last_run"),
@@ -522,8 +481,74 @@ def publish_auto_assist_state(mpub: MqttPub, topic_prefix: str, st: Dict[str, An
     )
 
 
+def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+
+    dp = cfg["discovery_prefix"]
+    tp = cfg["topic_prefix"]
+    ha_device_name = cfg["ha_device_name"]
+    ha_device_id = cfg["ha_device_id"]
+
+    device_block = {
+        "identifiers": [ha_device_id],
+        "name": ha_device_name,
+        "manufacturer": "tado°",
+        "model": "Tado Assistant (Ingress)",
+    }
+
+    # Canonical discovery path: node_id + object_id
+    node_id = ha_device_id
+    object_id = "auto_assist"
+    config_topic = f"{dp}/switch/{node_id}/{object_id}/config"
+
+    availability_topic = f"{tp}/_status"
+
+    payload = {
+        "name": "Tado Assistant Auto-Assist",
+        "unique_id": f"{ha_device_id}_auto_assist",
+        "state_topic": f"{tp}/{AUTO_ASSIST_STATE_TOPIC}",
+        "command_topic": f"{tp}/{AUTO_ASSIST_SET_TOPIC}",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "state_on": "ON",
+        "state_off": "OFF",
+        "optimistic": False,
+        "retain": True,
+
+        "availability_topic": availability_topic,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+
+        "json_attributes_topic": f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        "device": device_block,
+        "icon": "mdi:robot",
+    }
+
+    mpub.publish_json(config_topic, payload, retain=True)
+
+
+def cleanup_old_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+
+    dp = cfg["discovery_prefix"]
+    ha_device_id = cfg["ha_device_id"]
+
+    old_topics = [
+        # non-canonical variants used previously
+        f"{dp}/switch/{ha_device_id}_auto_assist/config",
+        f"{dp}/switch/{ha_device_id}/{ha_device_id}_auto_assist/config",
+        f"{dp}/switch/{ha_device_id}/{ha_device_id}_auto_assist_switch/config",
+        # some double-prefixed attempts
+        f"{dp}/switch/{ha_device_id}_tado_assistant_auto_assist/config",
+    ]
+    for t in old_topics:
+        mpub.publish_delete_retained(t)
+
+
 # -----------------------------
-# Presence normalization + discovery
+# Presence normalization / publish + discovery (unchanged, already working for you)
 # -----------------------------
 def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
     name = device.get("name") or device.get("deviceName") or device.get("model") or "unknown"
@@ -545,11 +570,11 @@ def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": dev_id, "name": name, "state": state, "at_home": at_home, "_ts": now_iso(), "raw": device}
 
 
-def discovery_object_ids(ha_device_id: str, device_id: int) -> Tuple[str, str]:
-    # final object ids (stable)
+def discovery_object_ids(ha_device_id: str, device_id: int) -> Tuple[str, str, str]:
     tracker_object_id = f"{ha_device_id}_presence_{device_id}"
     raw_object_id = f"{ha_device_id}_presence_{device_id}_raw"
-    return tracker_object_id, raw_object_id
+    old_json_object_id = f"{ha_device_id}_presence_{device_id}_json"
+    return tracker_object_id, raw_object_id, old_json_object_id
 
 
 def publish_discovery_for_devices(
@@ -575,37 +600,42 @@ def publish_discovery_for_devices(
 
     # Home raw (optional)
     if enable_raw_sensors:
-        home_object_id = f"{ha_device_id}_home_{home_id}_raw"
-        home_config_topic = f"{discovery_prefix}/sensor/{home_object_id}/config"
-        home_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
+        agg_object_id_new = f"{ha_device_id}_home_{home_id}_raw"
+        agg_object_id_old = f"{ha_device_id}_home_{home_id}_presence"
+        agg_config_topic_new = f"{discovery_prefix}/sensor/{agg_object_id_new}/config"
+        agg_config_topic_old = f"{discovery_prefix}/sensor/{agg_object_id_old}/config"
+        agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
 
-        home_payload = {
+        mpub.publish_delete_retained(agg_config_topic_old)
+
+        agg_payload = {
             "name": f"Tado Home {home_id} (raw)",
             "unique_id": f"{ha_device_id}_home_{home_id}_raw",
-            "state_topic": home_topic,
+            "state_topic": agg_topic,
             "value_template": "{{ value_json._ts }}",
-            "json_attributes_topic": home_topic,
+            "json_attributes_topic": agg_topic,
             "availability_topic": availability_topic,
             "payload_available": "online",
             "payload_not_available": "offline",
             "device": device_block,
             "icon": "mdi:home-account",
         }
-        mpub.publish_json(home_config_topic, home_payload, retain=True)
+        mpub.publish_json(agg_config_topic_new, agg_payload, retain=True)
 
     for d in devices:
         did = d.get("id")
+        name = d.get("name") or f"Device {did}"
         if not did:
             continue
         did_int = int(did)
-        name = d.get("name") or f"Device {did_int}"
 
-        tracker_object_id, raw_object_id = discovery_object_ids(ha_device_id, did_int)
+        tracker_object_id, raw_object_id, old_json_object_id = discovery_object_ids(ha_device_id, did_int)
 
         state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/state"
         raw_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/raw"
 
-        # device_tracker
+        mpub.publish_delete_retained(f"{discovery_prefix}/binary_sensor/{tracker_object_id}/config")
+
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
             "name": f"Tado {name}",
@@ -622,6 +652,8 @@ def publish_discovery_for_devices(
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
         if enable_raw_sensors:
+            mpub.publish_delete_retained(f"{discovery_prefix}/sensor/{old_json_object_id}/config")
+
             raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
             raw_payload = {
                 "name": f"Tado {name} (raw)",
@@ -654,8 +686,8 @@ def publish_presence(
             mpub.publish_json(raw_topic, d, retain=True)
 
     if enable_raw_sensors:
-        home_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
-        mpub.publish_json(home_topic, {"_ts": now_iso(), "home_id": home_id, "devices": devices}, retain=True)
+        agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
+        mpub.publish_json(agg_topic, {"_ts": now_iso(), "home_id": home_id, "devices": devices}, retain=True)
 
     cache = read_json(LAST_DEVICES_PATH)
     if not isinstance(cache, dict):
@@ -664,10 +696,12 @@ def publish_presence(
     write_json_atomic(LAST_DEVICES_PATH, cache)
 
 
-def republish_from_cache(mpub: MqttPub, topic_prefix: str, enable_raw: bool) -> None:
+def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
     cache = read_json(LAST_DEVICES_PATH)
     if not isinstance(cache, dict):
         return
+    topic_prefix = cfg["topic_prefix"]
+    enable_raw = bool(cfg.get("enable_raw_sensors", True))
     for home_id_s, payload in cache.items():
         try:
             home_id = int(home_id_s)
@@ -682,91 +716,31 @@ def republish_from_cache(mpub: MqttPub, topic_prefix: str, enable_raw: bool) -> 
                 pass
 
 
-# -----------------------------
-# Legacy cleanup (remove old retained discovery configs)
-# -----------------------------
-def _cleanup_done() -> bool:
-    m = read_json(CLEANUP_MARKER_PATH)
-    return isinstance(m, dict) and m.get("done") is True
+def load_cached_home_ids() -> Optional[List[int]]:
+    st = read_json(DISCOVERY_STATE_PATH)
+    if isinstance(st, dict):
+        hid = st.get("home_ids")
+        if isinstance(hid, list):
+            out: List[int] = []
+            for x in hid:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    pass
+            return sorted(list(set(out))) if out else None
+    return None
 
 
-def _mark_cleanup_done() -> None:
-    write_json_atomic(CLEANUP_MARKER_PATH, {"done": True, "ts": now_iso()})
-
-
-def cleanup_legacy_discovery_once(
-    mpub: MqttPub,
-    discovery_prefix: str,
-    candidate_ha_ids: List[str],
-    home_ids: List[int],
-    device_ids_by_home: Dict[int, Set[int]],
-) -> None:
-    if not mpub.client:
-        return
-    if _cleanup_done():
-        return
-
-    # Components we may have published historically
-    components = ["binary_sensor", "device_tracker", "sensor", "switch"]
-
-    # Old object id patterns we try to delete
-    def object_id_variants(ha_id: str, home_id: int, dev_id: Optional[int]) -> List[str]:
-        out: List[str] = []
-
-        # switch
-        out.append(f"{ha_id}_auto_assist")
-        out.append(f"{ha_id}_tado_auto_assist")
-
-        if dev_id is not None:
-            out += [
-                f"{ha_id}_presence_{dev_id}",
-                f"{ha_id}_presence_{dev_id}_raw",
-                f"{ha_id}_tado_presence_{dev_id}",
-                f"{ha_id}_tado_presence_{dev_id}_raw",
-                f"{ha_id}_presence_home_{home_id}_device_{dev_id}",
-                f"{ha_id}_presence_home_{home_id}_device_{dev_id}_raw",
-                f"{ha_id}_tado_presence_home_{home_id}_device_{dev_id}",
-                f"{ha_id}_tado_presence_home_{home_id}_device_{dev_id}_raw",
-            ]
-        # home raw variants
-        out += [
-            f"{ha_id}_home_{home_id}_raw",
-            f"{ha_id}_tado_presence_home_{home_id}",
-            f"{ha_id}_tado_presence_home_{home_id}_raw",
-        ]
-        # de-dup preserve order
-        seen: Set[str] = set()
-        uniq: List[str] = []
-        for x in out:
-            if x not in seen:
-                seen.add(x)
-                uniq.append(x)
-        return uniq
-
-    deletions = 0
-
-    for ha_id in candidate_ha_ids:
-        for home_id in home_ids:
-            # home-level objects
-            for obj in object_id_variants(ha_id, home_id, None):
-                for comp in components:
-                    topic = f"{discovery_prefix}/{comp}/{obj}/config"
-                    mpub.publish_delete_retained(topic)
-                    deletions += 1
-
-            for dev_id in sorted(list(device_ids_by_home.get(home_id, set()))):
-                for obj in object_id_variants(ha_id, home_id, dev_id):
-                    for comp in components:
-                        topic = f"{discovery_prefix}/{comp}/{obj}/config"
-                        mpub.publish_delete_retained(topic)
-                        deletions += 1
-
-    _mark_cleanup_done()
-    log(f"legacy discovery cleanup done (deleted retained configs ~{deletions} topics)")
+def save_cached_home_ids(home_ids: List[int]) -> None:
+    st = read_json(DISCOVERY_STATE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    st["home_ids"] = home_ids
+    write_json_atomic(DISCOVERY_STATE_PATH, st)
 
 
 # -----------------------------
-# Main
+# Main loop
 # -----------------------------
 def main() -> None:
     cfg = load_config()
@@ -777,110 +751,65 @@ def main() -> None:
     ha_device_name = cfg["ha_device_name"]
     ha_device_id = cfg["ha_device_id"]
     enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
-    cleanup_legacy = bool(cfg.get("cleanup_legacy_discovery", True))
 
     log(f"starting. poll_seconds={poll} enable_raw_sensors={enable_raw_sensors}")
 
-    # Auto-Assist: OFF on boot
-    aa_state = load_auto_assist_state(force_off_on_boot=True)
-    save_auto_assist_state(aa_state)
+    # Force OFF after every restart (your requirement)
+    boot_auto_assist_force_off()
 
     mpub = MqttPub(cfg["mqtt"])
 
-    # Command handler
-    def _on_mqtt_message(topic: str, payload: str) -> None:
-        nonlocal aa_state
-        if topic != f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}":
+    def handle_mqtt_message(topic: str, payload: str) -> None:
+        wanted = f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}"
+        if topic != wanted:
             return
 
         cmd = (payload or "").strip().upper()
+        st = read_auto_assist_runtime()
+
         if cmd not in ("ON", "OFF"):
-            aa_state["last_run"] = now_iso()
-            aa_state["last_action"] = "reject_command"
-            aa_state["last_error"] = f"invalid payload: {payload!r}"
-            save_auto_assist_state(aa_state)
-            publish_auto_assist_state(mpub, topic_prefix, aa_state)
+            st["last_error"] = f"invalid command payload: '{payload}'"
+            st["last_action"] = "reject_command"
+            st["last_run"] = now_iso()
+            write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+            publish_auto_assist(mpub, cfg, st)
             return
 
-        aa_state["enabled"] = (cmd == "ON")
-        aa_state["last_run"] = now_iso()
-        aa_state["last_action"] = "switch_on" if aa_state["enabled"] else "switch_off"
-        aa_state["last_error"] = None
-        save_auto_assist_state(aa_state)
-        publish_auto_assist_state(mpub, topic_prefix, aa_state)
+        st["enabled"] = (cmd == "ON")
+        st["last_action"] = "switch_on" if st["enabled"] else "switch_off"
+        st["last_error"] = None
+        st["last_run"] = now_iso()
+        write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+        publish_auto_assist(mpub, cfg, st)
         log(f"Auto-Assist switched {cmd}")
 
-    mpub.set_on_message(_on_mqtt_message)
+    mpub.set_on_message(handle_mqtt_message)
 
-    # Connect handler
-    def _on_mqtt_connect() -> None:
-        # Online status first (retained)
+    def handle_connect() -> None:
+        # Availability first
         mpub.publish(f"{topic_prefix}/_status", "online", retain=True)
 
-        # Publish switch discovery + current state/attrs, then subscribe
-        publish_auto_assist_discovery(mpub, discovery_prefix, topic_prefix, ha_device_name, ha_device_id)
-        publish_auto_assist_state(mpub, topic_prefix, aa_state)
+        # Remove old retained switch configs so HA stops using them
+        cleanup_old_auto_assist_discovery(mpub, cfg)
+
+        # Publish new switch discovery + initial state/attrs
+        publish_auto_assist_discovery(mpub, cfg)
+        publish_auto_assist(mpub, cfg, read_auto_assist_runtime())
+
+        # Subscribe to HA commands
         mpub.subscribe(f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}")
-        log("auto_assist discovery/state published + subscribed")
 
-        # One-time cleanup to remove duplicated entities (retained discovery configs from old versions)
-        if cleanup_legacy:
-            # Use any cached info to know device ids
-            device_ids_by_home: Dict[int, Set[int]] = {}
-            home_ids: List[int] = []
-            cached = read_json(LAST_DEVICES_PATH)
-            if isinstance(cached, dict):
-                for hid_s, payload in cached.items():
-                    try:
-                        hid = int(hid_s)
-                    except Exception:
-                        continue
-                    home_ids.append(hid)
-                    device_ids_by_home.setdefault(hid, set())
-                    if isinstance(payload, dict) and isinstance(payload.get("devices"), list):
-                        for d in payload["devices"]:
-                            try:
-                                device_ids_by_home[hid].add(int(d.get("id")))
-                            except Exception:
-                                pass
+        log("auto-assist: discovery+state published; command subscribed")
 
-            # If no cache, still try at least with configured home ids
-            if not home_ids and isinstance(cfg.get("tado_home_ids"), list):
-                home_ids = list(cfg["tado_home_ids"])
+    mpub.set_on_connect(handle_connect)
 
-            # Candidate ha_device_ids we try to delete (covers old variants)
-            candidates = [
-                ha_device_id,
-                "tado_assistant",
-                "tado_assistant_tado",
-                f"{ha_device_id}_tado",
-            ]
-            # De-dup
-            seen = set()
-            candidates = [x for x in candidates if x and (x not in seen and not seen.add(x))]  # type: ignore
-
-            cleanup_legacy_discovery_once(
-                mpub,
-                discovery_prefix=discovery_prefix,
-                candidate_ha_ids=candidates,
-                home_ids=sorted(list(set(home_ids))),
-                device_ids_by_home=device_ids_by_home,
-            )
-
-    mpub.set_on_connect(_on_mqtt_connect)
-
-    # LWT so HA sees offline if container dies
+    # LWT marks offline if addon dies
     mpub.start(lwt_topic=f"{topic_prefix}/_status")
 
-    # Republish cached presence early (helps HA show data during rate limit)
-    republish_from_cache(mpub, topic_prefix, enable_raw_sensors)
+    republish_from_cache(mpub, cfg)
 
-    # Cache home ids to avoid /me every loop (reduces 429 together with official integration)
-    cached_home_ids: Optional[List[int]] = cfg.get("tado_home_ids")
-    if not cached_home_ids:
-        st = read_json(DISCOVERY_STATE_PATH)
-        if isinstance(st, dict) and isinstance(st.get("home_ids"), list):
-            cached_home_ids = _parse_int_list(st.get("home_ids"))
+    explicit_home_ids: Optional[List[int]] = cfg.get("tado_home_ids")
+    home_ids: Optional[List[int]] = explicit_home_ids or load_cached_home_ids()
 
     backoff_base = int(cfg["rate_limit_backoff_seconds"])
     backoff_max = int(cfg["rate_limit_backoff_max_seconds"])
@@ -899,17 +828,15 @@ def main() -> None:
             tokens = ensure_valid_tokens()
             access_token = tokens["access_token"]
 
-            # Resolve home ids only if unknown
-            if not cached_home_ids:
-                cached_home_ids = get_home_ids(access_token)
-                write_json_atomic(DISCOVERY_STATE_PATH, {"home_ids": cached_home_ids, "updated_at": now_iso()})
-                log(f"home ids resolved: {cached_home_ids}")
+            if home_ids is None:
+                home_ids = get_home_ids(access_token)
+                save_cached_home_ids(home_ids)
+                log(f"home ids resolved: {home_ids}")
 
-            for home_id in cached_home_ids:
+            for home_id in home_ids:
                 devices_raw = get_mobile_devices(access_token, home_id)
                 devices = [normalize_presence(d) for d in devices_raw]
 
-                # Discovery (rare)
                 if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
                     publish_discovery_for_devices(
                         mpub,
@@ -921,27 +848,18 @@ def main() -> None:
                         devices,
                         enable_raw_sensors,
                     )
-                    publish_auto_assist_discovery(mpub, discovery_prefix, topic_prefix, ha_device_name, ha_device_id)
 
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
 
-            # Always publish Auto-Assist attrs so HA has attributes immediately
-            aa_state = read_json(AUTO_ASSIST_STATE_PATH)
-            if not isinstance(aa_state, dict):
-                aa_state = {"enabled": False, "last_run": None, "last_action": None, "last_error": None}
-            aa_state.setdefault("enabled", False)
-            aa_state.setdefault("last_run", None)
-            aa_state.setdefault("last_action", None)
-            aa_state.setdefault("last_error", None)
-
-            if aa_state.get("enabled") is True:
-                aa_state["last_run"] = now_iso()
-                aa_state["last_action"] = "tick"
-                aa_state["last_error"] = None
-                save_auto_assist_state(aa_state)
-
-            publish_auto_assist_state(mpub, topic_prefix, aa_state)
+            # Auto-Assist heartbeat metadata when enabled (real actions come next)
+            st = read_auto_assist_runtime()
+            if st.get("enabled") is True:
+                st["last_run"] = now_iso()
+                st["last_action"] = "tick"
+                st["last_error"] = None
+                write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+                publish_auto_assist(mpub, cfg, st)
 
             backoff_current = backoff_base
             time.sleep(poll)
@@ -952,23 +870,19 @@ def main() -> None:
             sleep_s = min(sleep_s, backoff_max)
             log(f"WARN: Tado rate limit (429) on {e.path} -> backoff {sleep_s}s")
 
-            republish_from_cache(mpub, topic_prefix, enable_raw_sensors)
+            republish_from_cache(mpub, cfg)
 
             backoff_current = min(backoff_current * 2, backoff_max)
             time.sleep(sleep_s)
 
         except Exception as e:
-            # reflect error into auto-assist attrs
             try:
-                aa = read_json(AUTO_ASSIST_STATE_PATH)
-                if not isinstance(aa, dict):
-                    aa = {"enabled": False}
-                aa.setdefault("enabled", False)
-                aa["last_run"] = now_iso()
-                aa["last_action"] = "error"
-                aa["last_error"] = str(e)
-                save_auto_assist_state(aa)
-                publish_auto_assist_state(mpub, topic_prefix, aa)
+                st = read_auto_assist_runtime()
+                st["last_run"] = now_iso()
+                st["last_action"] = "error"
+                st["last_error"] = str(e)
+                write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+                publish_auto_assist(mpub, cfg, st)
             except Exception:
                 pass
 
