@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -11,7 +11,6 @@ try:
     import paho.mqtt.client as mqtt
 except Exception:
     mqtt = None
-
 
 # ===== Paths =====
 DATA_DIR = "/data"
@@ -22,12 +21,8 @@ OPTIONS_PATH = os.path.join(DATA_DIR, "options.json")
 # Merkt sich, welche Device-IDs wir zuletzt per Discovery veröffentlicht haben (pro home)
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
 
-# Cache für Home-IDs, damit /me nicht ständig aufgerufen wird (vermeidet 429 Rate-Limit)
+# Cache für Home-IDs (damit wir /me NICHT ständig aufrufen -> 429)
 HOME_IDS_CACHE_PATH = os.path.join(DATA_DIR, "tado_assistant_home_ids_cache.json")
-HOME_IDS_TTL_SECONDS = 12 * 60 * 60  # 12h
-
-# Auto-Assist: Open-Window Aktivierungszeiten (persistiert)
-OPEN_WINDOW_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_open_window_state.json")
 
 # ===== Tado OAuth + API =====
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
@@ -42,20 +37,8 @@ HTTP_TIMEOUT = 20
 # Discovery republish (falls HA/retained mal „verschluckt“ wurde)
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
-# Auto-Assist Defaults (safe: alles aus)
-AUTO_ASSIST_DEFAULTS = {
-    "enabled": False,
-    "geofencing": False,
-    "open_window": False,
-    "max_open_window_duration_seconds": None,  # None = nie zwangsweise beenden
-    "min_presence_lock_interval_seconds": 90,  # Spam-Schutz presenceLock
-}
-
-
-class RateLimitError(RuntimeError):
-    def __init__(self, message: str, retry_after: Optional[int] = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
+# Home-IDs Cache TTL (sek). Wenn abgelaufen, versuchen wir EINMAL /me – aber nutzen alten Cache als Fallback.
+HOME_IDS_CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 Tage
 
 
 def now_iso() -> str:
@@ -66,7 +49,7 @@ def log(msg: str) -> None:
     print(f"[worker] {msg}", flush=True)
 
 
-def read_json(path: str) -> Optional[Dict[str, Any]]:
+def read_json(path: str) -> Optional[Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -77,7 +60,7 @@ def read_json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
+def write_json_atomic(path: str, obj: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -85,18 +68,34 @@ def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _as_bool(v: Any) -> bool:
-    # HA liefert meistens echte bools; wir bleiben absichtlich konservativ
-    return v is True
-
-
-def _as_int_optional(v: Any) -> Optional[int]:
-    if v is None or v == "":
-        return None
-    try:
-        return int(v)
-    except Exception:
-        return None
+def _parse_int_list(val: Any) -> List[int]:
+    """
+    Akzeptiert:
+      - int
+      - list[int|str]
+      - str: "1,2,3"
+    """
+    out: List[int] = []
+    if val is None:
+        return out
+    if isinstance(val, int):
+        return [val]
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        for p in parts:
+            try:
+                out.append(int(p))
+            except Exception:
+                pass
+        return out
+    if isinstance(val, list):
+        for x in val:
+            try:
+                out.append(int(x))
+            except Exception:
+                continue
+        return out
+    return out
 
 
 def load_config() -> Dict[str, Any]:
@@ -125,6 +124,8 @@ def load_config() -> Dict[str, Any]:
         mcfg["password"] = opt.get("mqtt_password")
     if "mqtt_tls" in opt:
         mcfg["tls"] = bool(opt.get("mqtt_tls"))
+    if "mqtt_client_id" in opt:
+        mcfg["client_id"] = opt.get("mqtt_client_id")
 
     topic_prefix = opt.get("mqtt_topic_prefix") or opt.get("topic_prefix") or "tado_assistant"
     topic_prefix = str(topic_prefix).strip().strip("/")
@@ -135,34 +136,22 @@ def load_config() -> Dict[str, Any]:
     ha_device_name = opt.get("ha_device_name") or "Tado Assistant"
     ha_device_id = opt.get("ha_device_id") or "tado_assistant"
 
-    # Auto-Assist (alles optional)
-    aa_opt = opt.get("auto_assist", {})
-    if not isinstance(aa_opt, dict):
-        aa_opt = {}
-
-    aa = dict(AUTO_ASSIST_DEFAULTS)
-    aa["enabled"] = _as_bool(aa_opt.get("enabled")) or _as_bool(opt.get("auto_assist_enabled"))
-    aa["geofencing"] = _as_bool(aa_opt.get("geofencing")) or _as_bool(opt.get("auto_assist_geofencing"))
-    aa["open_window"] = _as_bool(aa_opt.get("open_window")) or _as_bool(opt.get("auto_assist_open_window"))
-
-    aa["max_open_window_duration_seconds"] = _as_int_optional(
-        aa_opt.get("max_open_window_duration_seconds", aa_opt.get("max_open_window_duration"))
+    # Optional: Home IDs fix/override, damit wir /me gar nicht brauchen.
+    # Unterstützte Keys: tado_home_id, tado_home_ids, home_ids
+    override = (
+        opt.get("tado_home_ids")
+        if "tado_home_ids" in opt
+        else opt.get("home_ids")
+        if "home_ids" in opt
+        else opt.get("tado_home_id")
     )
-    if "auto_assist_max_open_window_duration_seconds" in opt:
-        aa["max_open_window_duration_seconds"] = _as_int_optional(opt.get("auto_assist_max_open_window_duration_seconds"))
+    home_ids_override = sorted(list(set(_parse_int_list(override))))
 
-    if "min_presence_lock_interval_seconds" in aa_opt:
-        try:
-            aa["min_presence_lock_interval_seconds"] = int(
-                aa_opt.get("min_presence_lock_interval_seconds") or aa["min_presence_lock_interval_seconds"]
-            )
-        except Exception:
-            pass
-    if "auto_assist_min_presence_lock_interval_seconds" in opt:
-        try:
-            aa["min_presence_lock_interval_seconds"] = int(opt.get("auto_assist_min_presence_lock_interval_seconds"))
-        except Exception:
-            pass
+    enable_raw_sensors = opt.get("enable_raw_sensors")
+    if enable_raw_sensors is None:
+        enable_raw_sensors = True
+    else:
+        enable_raw_sensors = bool(enable_raw_sensors)
 
     return {
         "poll_seconds": poll,
@@ -171,7 +160,8 @@ def load_config() -> Dict[str, Any]:
         "discovery_prefix": discovery_prefix,
         "ha_device_name": ha_device_name,
         "ha_device_id": ha_device_id,
-        "auto_assist": aa,
+        "home_ids_override": home_ids_override,
+        "enable_raw_sensors": enable_raw_sensors,
         "raw": opt,
     }
 
@@ -227,10 +217,7 @@ def refresh_tokens(tokens: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str
 
     try:
         r = requests.post(TOKEN_URL, data=payload, timeout=HTTP_TIMEOUT)
-        try:
-            data = r.json()
-        except Exception:
-            data = r.text
+        data = r.json()
     except Exception as e:
         return False, f"refresh request failed: {e}", None
 
@@ -249,16 +236,6 @@ def refresh_tokens(tokens: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str
     if isinstance(data, dict):
         err = data.get("error") or data.get("error_description") or ""
     return False, f"refresh failed: {err or data}", None
-
-
-def _retry_after_from_headers(headers: Dict[str, Any]) -> Optional[int]:
-    ra = headers.get("Retry-After") or headers.get("retry-after")
-    if not ra:
-        return None
-    try:
-        return int(str(ra).strip())
-    except Exception:
-        return None
 
 
 class MqttPub:
@@ -282,6 +259,7 @@ class MqttPub:
         tls = bool(self.cfg.get("tls", False))
 
         client_id = self.cfg.get("client_id") or f"tado_assistant_{int(time.time())}"
+
         c = mqtt.Client(client_id=client_id, clean_session=True)
 
         if username:
@@ -308,36 +286,20 @@ class MqttPub:
             return
         self.client.publish(topic, payload, qos=0, retain=retain)
 
-    def publish_json(self, topic: str, payload: Dict[str, Any], retain: bool = True) -> None:
+    def publish_json(self, topic: str, payload: Any, retain: bool = True) -> None:
         self.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
 
     def publish_delete_retained(self, topic: str) -> None:
-        # retained löschen: leere Payload retained (HA Discovery: config löschen)
         self.publish(topic, "", retain=True)
 
 
-def api_request(
-    method: str,
-    path: str,
-    access_token: str,
-    params: Optional[dict] = None,
-    json_body: Optional[dict] = None,
-) -> Tuple[int, Any]:
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any]:
     url = f"{API_BASE}{path}"
     headers = {"Authorization": f"Bearer {access_token}"}
-
     try:
-        r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=HTTP_TIMEOUT)
+        r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
     except Exception as e:
         return 0, f"request failed: {e}"
-
-    if r.status_code == 429:
-        return 429, {
-            "_rate_limited": True,
-            "retry_after": _retry_after_from_headers(r.headers),
-            "body": r.text,
-        }
-
     try:
         return r.status_code, r.json()
     except Exception:
@@ -360,81 +322,97 @@ def ensure_valid_tokens() -> Dict[str, Any]:
     return tokens
 
 
-# ===== home ids cache =====
-
-def load_home_ids_cache() -> Optional[Dict[str, Any]]:
-    st = read_json(HOME_IDS_CACHE_PATH)
-    if not isinstance(st, dict):
-        return None
-    if not isinstance(st.get("home_ids"), list):
-        return None
-    return st
-
-
-def save_home_ids_cache(home_ids: list) -> None:
-    write_json_atomic(
-        HOME_IDS_CACHE_PATH,
-        {"home_ids": home_ids, "fetched_at_epoch": int(time.time()), "fetched_at": now_iso()},
-    )
-
-
-def _extract_home_ids_from_me(data: Any) -> list:
+def _extract_home_ids_from_me(data: Any) -> List[int]:
     home_ids: List[int] = []
     if isinstance(data, dict):
         if isinstance(data.get("homes"), list):
             for h in data["homes"]:
-                if not isinstance(h, dict):
-                    continue
-                hid = h.get("id") or h.get("homeId")
-                if isinstance(hid, int):
-                    home_ids.append(hid)
+                if isinstance(h, dict):
+                    hid = h.get("id") or h.get("homeId")
+                    if isinstance(hid, int):
+                        home_ids.append(hid)
         if isinstance(data.get("homeId"), int):
             home_ids.append(data["homeId"])
-    home_ids = sorted(list(set(home_ids)))
-    return home_ids
+    return sorted(list(set([int(x) for x in home_ids if isinstance(x, int)])))
 
 
-def get_home_ids_cached(access_token: str) -> list:
-    cache = load_home_ids_cache()
+def _read_home_ids_cache() -> Tuple[Optional[List[int]], Optional[int]]:
+    obj = read_json(HOME_IDS_CACHE_PATH)
+    if not isinstance(obj, dict):
+        return None, None
+    ids = obj.get("home_ids")
+    cached_at = obj.get("cached_at_epoch")
+    if not isinstance(ids, list):
+        return None, None
+    try:
+        ids_int = sorted(list(set([int(x) for x in ids])))
+    except Exception:
+        return None, None
+    try:
+        cached_at_int = int(cached_at) if cached_at is not None else None
+    except Exception:
+        cached_at_int = None
+    return ids_int, cached_at_int
 
-    # frisch genug? -> direkt verwenden
-    if cache:
-        try:
-            age = int(time.time()) - int(cache.get("fetched_at_epoch", 0))
-        except Exception:
-            age = HOME_IDS_TTL_SECONDS + 1
-        if 0 <= age < HOME_IDS_TTL_SECONDS and cache["home_ids"]:
-            return cache["home_ids"]
 
+def _write_home_ids_cache(home_ids: List[int]) -> None:
+    write_json_atomic(
+        HOME_IDS_CACHE_PATH,
+        {"home_ids": sorted(list(set([int(x) for x in home_ids]))), "cached_at_epoch": int(time.time()), "_at": now_iso()},
+    )
+
+
+def resolve_home_ids(access_token: str, discovery_state: Dict[str, Any], cfg: Dict[str, Any]) -> List[int]:
+    # 0) Override aus options.json
+    override = cfg.get("home_ids_override") or []
+    if override:
+        _write_home_ids_cache(override)
+        log(f"home ids: using override from options.json: {override}")
+        return override
+
+    # 1) Cache
+    cached_ids, cached_at = _read_home_ids_cache()
+    cache_age = (int(time.time()) - cached_at) if cached_ids and cached_at else None
+    if cached_ids and cache_age is not None and cache_age <= HOME_IDS_CACHE_TTL_SECONDS:
+        return cached_ids
+
+    # 2) Discovery-State
+    try:
+        homes = discovery_state.get("homes")
+        if isinstance(homes, dict) and homes:
+            ids = []
+            for k in homes.keys():
+                try:
+                    ids.append(int(k))
+                except Exception:
+                    continue
+            ids = sorted(list(set(ids)))
+            if ids:
+                _write_home_ids_cache(ids)
+                log(f"home ids: using from discovery_state: {ids}")
+                return ids
+    except Exception:
+        pass
+
+    # 3) /me (nur wenn wir GAR nichts haben)
     status, data = api_request("GET", "/me", access_token)
+    if status == 200:
+        ids = _extract_home_ids_from_me(data)
+        if not ids:
+            raise RuntimeError(f"No home ids found in /me response: {data}")
+        _write_home_ids_cache(ids)
+        return ids
 
-    if status == 429:
-        if cache and cache.get("home_ids"):
-            ra = data.get("retry_after") if isinstance(data, dict) else None
-            log(f"WARN: Tado rate limit (429) on /me -> using cached home_ids (Retry-After={ra})")
-            return cache["home_ids"]
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError("Tado rate limit (429) on /me and no cache yet", retry_after=ra or 60)
+    # 4) Fallback: alter Cache auch wenn TTL abgelaufen ist
+    if cached_ids:
+        log(f"WARN: /me failed status={status}. Using stale cache home_ids={cached_ids}")
+        return cached_ids
 
-    if status != 200:
-        if cache and cache.get("home_ids"):
-            log(f"WARN: /me failed status={status} -> using cached home_ids")
-            return cache["home_ids"]
-        raise RuntimeError(f"/me failed status={status} data={data}")
-
-    home_ids = _extract_home_ids_from_me(data)
-    if not home_ids:
-        raise RuntimeError(f"No home ids found in /me response: {data}")
-
-    save_home_ids_cache(home_ids)
-    return home_ids
+    raise RuntimeError(f"/me failed status={status} data={data}")
 
 
 def get_mobile_devices(access_token: str, home_id: int) -> list:
     status, data = api_request("GET", f"/homes/{home_id}/mobileDevices", access_token)
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on mobileDevices (home={home_id})", retry_after=ra or 60)
     if status != 200:
         raise RuntimeError(f"/homes/{home_id}/mobileDevices failed status={status} data={data}")
     return data if isinstance(data, list) else []
@@ -450,19 +428,26 @@ def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
     elif "atHome" in device:
         at_home = device.get("atHome")
 
+    # HA device_tracker: "home" / "not_home"
     if isinstance(at_home, bool):
-        state = "home" if at_home else "away"
+        state = "home" if at_home else "not_home"
     else:
         state = "unknown"
 
-    return {"id": dev_id, "name": name, "state": state, "at_home": at_home, "_ts": now_iso()}
+    return {
+        "id": dev_id,
+        "name": name,
+        "state": state,
+        "at_home": at_home,
+        "_ts": now_iso(),
+        "raw": device,
+    }
 
 
 def discovery_object_ids(ha_device_id: str, device_id: int) -> Tuple[str, str]:
-    # object_id muss stabil bleiben, sonst entstehen Duplikate
-    bin_object_id = f"{ha_device_id}_presence_{device_id}"
-    json_object_id = f"{ha_device_id}_presence_{device_id}_json"
-    return bin_object_id, json_object_id
+    tracker_object_id = f"{ha_device_id}_presence_{device_id}"
+    raw_object_id = f"{ha_device_id}_presence_{device_id}_raw"
+    return tracker_object_id, raw_object_id
 
 
 def publish_discovery_for_devices(
@@ -473,6 +458,7 @@ def publish_discovery_for_devices(
     ha_device_id: str,
     home_id: int,
     devices: list,
+    enable_raw_sensors: bool,
 ) -> None:
     if not mpub.client:
         return
@@ -491,65 +477,62 @@ def publish_discovery_for_devices(
         name = d.get("name") or f"Device {did}"
         if not did:
             continue
+        did_int = int(did)
 
-        try:
-            did_int = int(did)
-        except Exception:
-            continue
-
-        bin_object_id, json_object_id = discovery_object_ids(ha_device_id, did_int)
+        tracker_object_id, raw_object_id = discovery_object_ids(ha_device_id, did_int)
 
         state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did}/state"
         json_attr_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did}/json"
 
-        # Binary sensor
-        bin_config_topic = f"{discovery_prefix}/binary_sensor/{bin_object_id}/config"
-        bin_payload = {
+        # Device Tracker (statt binary_sensor)
+        tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
+        tracker_payload = {
             "name": f"Tado Presence {name}",
-            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did}_presence",
+            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did}_tracker",
             "state_topic": state_topic,
-            "payload_on": "home",
-            "payload_off": "away",
-            "device_class": "presence",
-            "availability_topic": availability_topic,
-            "payload_available": "online",
-            "payload_not_available": "offline",
-            "device": device_block,
-        }
-        mpub.publish_json(bin_config_topic, bin_payload, retain=True)
-
-        # JSON sensor (attributes)
-        json_config_topic = f"{discovery_prefix}/sensor/{json_object_id}/config"
-        json_payload = {
-            "name": f"Tado Presence {name} (raw)",
-            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did}_json",
-            "state_topic": state_topic,
+            "payload_home": "home",
+            "payload_not_home": "not_home",
+            "source_type": "gps",
             "json_attributes_topic": json_attr_topic,
             "availability_topic": availability_topic,
             "payload_available": "online",
             "payload_not_available": "offline",
             "device": device_block,
-            "icon": "mdi:account",
         }
-        mpub.publish_json(json_config_topic, json_payload, retain=True)
+        mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
-    # aggregated home sensor
-    agg_object_id = f"{ha_device_id}_home_{home_id}_presence"
-    agg_config_topic = f"{discovery_prefix}/sensor/{agg_object_id}/config"
-    agg_topic = f"{topic_prefix}/presence/home_{home_id}"
-    agg_payload = {
-        "name": f"Tado Presence Home {home_id}",
-        "unique_id": f"{ha_device_id}_home_{home_id}_presence_json",
-        "state_topic": agg_topic,
-        "value_template": "{{ value_json._ts }}",
-        "json_attributes_topic": agg_topic,
-        "availability_topic": availability_topic,
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "device": device_block,
-        "icon": "mdi:home-account",
-    }
-    mpub.publish_json(agg_config_topic, agg_payload, retain=True)
+        if enable_raw_sensors:
+            raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
+            raw_payload = {
+                "name": f"Tado Presence {name} (raw)",
+                "unique_id": f"{ha_device_id}_home_{home_id}_device_{did}_raw",
+                "state_topic": state_topic,
+                "json_attributes_topic": json_attr_topic,
+                "availability_topic": availability_topic,
+                "payload_available": "online",
+                "payload_not_available": "offline",
+                "device": device_block,
+                "icon": "mdi:account",
+            }
+            mpub.publish_json(raw_config_topic, raw_payload, retain=True)
+
+    if enable_raw_sensors:
+        agg_object_id = f"{ha_device_id}_home_{home_id}_raw"
+        agg_config_topic = f"{discovery_prefix}/sensor/{agg_object_id}/config"
+        agg_topic = f"{topic_prefix}/presence/home_{home_id}"
+        agg_payload = {
+            "name": f"Tado Presence Home {home_id} (raw)",
+            "unique_id": f"{ha_device_id}_home_{home_id}_raw",
+            "state_topic": agg_topic,
+            "value_template": "{{ value_json._ts }}",
+            "json_attributes_topic": agg_topic,
+            "availability_topic": availability_topic,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "device": device_block,
+            "icon": "mdi:home-account",
+        }
+        mpub.publish_json(agg_config_topic, agg_payload, retain=True)
 
 
 def discovery_cleanup_removed_devices(
@@ -557,19 +540,20 @@ def discovery_cleanup_removed_devices(
     discovery_prefix: str,
     ha_device_id: str,
     removed_device_ids: set,
+    enable_raw_sensors: bool,
 ) -> None:
     if not mpub.client:
         return
     for did in sorted(list(removed_device_ids)):
-        try:
-            did_int = int(did)
-        except Exception:
-            continue
-        bin_object_id, json_object_id = discovery_object_ids(ha_device_id, did_int)
-        bin_config_topic = f"{discovery_prefix}/binary_sensor/{bin_object_id}/config"
-        json_config_topic = f"{discovery_prefix}/sensor/{json_object_id}/config"
-        mpub.publish_delete_retained(bin_config_topic)
-        mpub.publish_delete_retained(json_config_topic)
+        tracker_object_id, raw_object_id = discovery_object_ids(ha_device_id, int(did))
+
+        tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
+        mpub.publish_delete_retained(tracker_config_topic)
+
+        if enable_raw_sensors:
+            raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
+            mpub.publish_delete_retained(raw_config_topic)
+
         log(f"discovery cleanup: removed device_id={did}")
 
 
@@ -587,226 +571,6 @@ def save_discovery_state(st: Dict[str, Any]) -> None:
     write_json_atomic(DISCOVERY_STATE_PATH, st)
 
 
-# =========================
-# Auto-Assist (Geofencing + Open Window)
-# =========================
-
-def load_open_window_state() -> Dict[str, Any]:
-    st = read_json(OPEN_WINDOW_STATE_PATH)
-    if not isinstance(st, dict):
-        st = {}
-    st.setdefault("homes", {})
-    if not isinstance(st["homes"], dict):
-        st["homes"] = {}
-    return st
-
-
-def save_open_window_state(st: Dict[str, Any]) -> None:
-    write_json_atomic(OPEN_WINDOW_STATE_PATH, st)
-
-
-def get_home_presence_state(access_token: str, home_id: int) -> Optional[str]:
-    status, data = api_request("GET", f"/homes/{home_id}/state", access_token)
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on /homes/{home_id}/state", retry_after=ra or 60)
-    if status != 200:
-        log(f"AUTO_ASSIST WARN: /homes/{home_id}/state failed status={status} data={data}")
-        return None
-    if isinstance(data, dict):
-        p = data.get("presence")
-        if isinstance(p, str) and p:
-            return p.upper()
-    return None
-
-
-def devices_at_home_names(mobile_devices: List[Dict[str, Any]]) -> List[str]:
-    names: List[str] = []
-    for d in mobile_devices:
-        try:
-            settings = d.get("settings") if isinstance(d.get("settings"), dict) else {}
-            geo_enabled = bool(settings.get("geoTrackingEnabled") is True)
-
-            loc = d.get("location") if isinstance(d.get("location"), dict) else {}
-            at_home = bool(loc.get("atHome") is True)
-
-            if geo_enabled and at_home:
-                name = d.get("name") or d.get("deviceName") or d.get("model") or "unknown"
-                names.append(str(name))
-        except Exception:
-            continue
-    return names
-
-
-def set_presence_lock(access_token: str, home_id: int, home_presence: str) -> bool:
-    home_presence = home_presence.upper()
-    if home_presence not in ("HOME", "AWAY"):
-        return False
-    status, data = api_request(
-        "PUT",
-        f"/homes/{home_id}/presenceLock",
-        access_token,
-        json_body={"homePresence": home_presence},
-    )
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on presenceLock (home={home_id})", retry_after=ra or 60)
-    if status not in (200, 204):
-        log(f"AUTO_ASSIST WARN: presenceLock failed home={home_id} status={status} data={data}")
-        return False
-    return True
-
-
-def get_zones(access_token: str, home_id: int) -> List[Dict[str, Any]]:
-    status, data = api_request("GET", f"/homes/{home_id}/zones", access_token)
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on /homes/{home_id}/zones", retry_after=ra or 60)
-    if status != 200:
-        log(f"AUTO_ASSIST WARN: /homes/{home_id}/zones failed status={status} data={data}")
-        return []
-    return data if isinstance(data, list) else []
-
-
-def get_zone_state(access_token: str, home_id: int, zone_id: int) -> Optional[Dict[str, Any]]:
-    status, data = api_request("GET", f"/homes/{home_id}/zones/{zone_id}/state", access_token)
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on zone state (home={home_id} zone={zone_id})", retry_after=ra or 60)
-    if status != 200:
-        log(f"AUTO_ASSIST WARN: zone state failed home={home_id} zone={zone_id} status={status} data={data}")
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def activate_open_window(access_token: str, home_id: int, zone_id: int) -> bool:
-    status, data = api_request("POST", f"/homes/{home_id}/zones/{zone_id}/state/openWindow/activate", access_token)
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on openWindow activate (home={home_id} zone={zone_id})", retry_after=ra or 60)
-    if status not in (200, 204):
-        log(f"AUTO_ASSIST WARN: openWindow activate failed home={home_id} zone={zone_id} status={status} data={data}")
-        return False
-    return True
-
-
-def cancel_open_window(access_token: str, home_id: int, zone_id: int) -> bool:
-    status, data = api_request("DELETE", f"/homes/{home_id}/zones/{zone_id}/state/openWindow", access_token)
-    if status == 429:
-        ra = data.get("retry_after") if isinstance(data, dict) else None
-        raise RateLimitError(f"429 on openWindow cancel (home={home_id} zone={zone_id})", retry_after=ra or 60)
-    if status not in (200, 204):
-        log(f"AUTO_ASSIST WARN: openWindow cancel failed home={home_id} zone={zone_id} status={status} data={data}")
-        return False
-    return True
-
-
-def auto_assist_geofencing_tick(
-    access_token: str,
-    home_id: int,
-    mobile_devices_raw: List[Dict[str, Any]],
-    aa_cfg: Dict[str, Any],
-    last_presence_lock_action: Dict[int, int],
-) -> None:
-    if not aa_cfg.get("geofencing"):
-        return
-
-    home_state = get_home_presence_state(access_token, home_id)
-    if home_state not in ("HOME", "AWAY"):
-        return
-
-    at_home = devices_at_home_names(mobile_devices_raw)
-
-    # Spam-Schutz
-    min_interval = int(
-        aa_cfg.get("min_presence_lock_interval_seconds") or AUTO_ASSIST_DEFAULTS["min_presence_lock_interval_seconds"]
-    )
-    now = int(time.time())
-    last = int(last_presence_lock_action.get(home_id, 0))
-    if last and (now - last) < min_interval:
-        return
-
-    if home_state == "HOME" and len(at_home) == 0:
-        if set_presence_lock(access_token, home_id, "AWAY"):
-            last_presence_lock_action[home_id] = now
-            log(f"AUTO_ASSIST: home={home_id} HOME->AWAY (no devices at home)")
-    elif home_state == "AWAY" and len(at_home) > 0:
-        if set_presence_lock(access_token, home_id, "HOME"):
-            last_presence_lock_action[home_id] = now
-            devs = ", ".join(at_home)
-            log(f"AUTO_ASSIST: home={home_id} AWAY->HOME (devices at home: {devs})")
-
-
-def auto_assist_open_window_tick(
-    access_token: str,
-    home_id: int,
-    aa_cfg: Dict[str, Any],
-    ow_state: Dict[str, Any],
-) -> bool:
-    if not aa_cfg.get("open_window"):
-        return False
-
-    changed = False
-    max_dur = aa_cfg.get("max_open_window_duration_seconds")
-    if max_dur is not None:
-        try:
-            max_dur = int(max_dur)
-        except Exception:
-            max_dur = None
-
-    homes = ow_state.setdefault("homes", {})
-    home_key = str(home_id)
-    home_block = homes.setdefault(home_key, {})
-    zones_times = home_block.setdefault("zones", {})
-    if not isinstance(zones_times, dict):
-        zones_times = {}
-        home_block["zones"] = zones_times
-
-    zones = get_zones(access_token, home_id)
-    now = int(time.time())
-
-    for z in zones:
-        try:
-            zone_id = z.get("id")
-            if not isinstance(zone_id, int):
-                continue
-            zone_name = z.get("name") or f"Zone {zone_id}"
-
-            owd = z.get("openWindowDetection") if isinstance(z.get("openWindowDetection"), dict) else {}
-            supported = bool(owd.get("supported") is True)
-            enabled = bool(owd.get("enabled") is True)
-            if not supported or not enabled:
-                continue
-
-            st = get_zone_state(access_token, home_id, zone_id)
-            if not st:
-                continue
-
-            zid_key = str(zone_id)
-            activated_at = _as_int_optional(zones_times.get(zid_key))
-
-            # 1) Max Duration erzwingen (auch wenn openWindowDetected inzwischen wieder false ist)
-            if activated_at is not None and max_dur is not None and (now - activated_at) > max_dur:
-                if cancel_open_window(access_token, home_id, zone_id):
-                    zones_times.pop(zid_key, None)
-                    changed = True
-                    log(f"AUTO_ASSIST: home={home_id} zone='{zone_name}' cancel openWindow (>{max_dur}s)")
-                continue
-
-            # 2) Aktivieren, wenn Detected
-            open_detected = bool(st.get("openWindowDetected") is True)
-            if open_detected and activated_at is None:
-                if activate_open_window(access_token, home_id, zone_id):
-                    zones_times[zid_key] = now
-                    changed = True
-                    log(f"AUTO_ASSIST: home={home_id} zone='{zone_name}' activate openWindow")
-
-        except Exception:
-            continue
-
-    return changed
-
-
 def main() -> None:
     cfg = load_config()
     poll = cfg["poll_seconds"]
@@ -814,29 +578,22 @@ def main() -> None:
     discovery_prefix = cfg["discovery_prefix"]
     ha_device_name = cfg["ha_device_name"]
     ha_device_id = cfg["ha_device_id"]
-    aa_cfg = cfg.get("auto_assist") or dict(AUTO_ASSIST_DEFAULTS)
+    enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
 
-    log(f"starting. poll_seconds={poll} auto_assist.enabled={aa_cfg.get('enabled')}")
+    log(f"starting. poll_seconds={poll} enable_raw_sensors={enable_raw_sensors}")
 
     mpub = MqttPub(cfg["mqtt"])
     mpub.start()
 
-    # availability online
     if mpub.client:
         mpub.publish(f"{topic_prefix}/_status", "online", retain=True)
         log(f"status published: {topic_prefix}/_status = online")
 
     discovery_state = load_discovery_state()
-
-    # Auto-Assist runtime state
-    open_window_state = load_open_window_state()
-    last_presence_lock_action: Dict[int, int] = {}
-
     loop = 0
+    home_ids: Optional[List[int]] = None
 
-    # WICHTIG: Erste Runde läuft sofort (ohne Sleep), damit HA nicht lange "unknown" bleibt
     while True:
-        sleep_seconds = poll
         loop += 1
         try:
             if not tokens_exist():
@@ -847,20 +604,23 @@ def main() -> None:
             tokens = ensure_valid_tokens()
             access_token = tokens["access_token"]
 
-            # 429 Fix: cached home_ids statt /me jedes Mal
-            home_ids = get_home_ids_cached(access_token)
-
-            ow_dirty = False
+            # Home-IDs NICHT jedes Mal holen! (das verursacht 429)
+            if home_ids is None:
+                home_ids = resolve_home_ids(access_token, discovery_state, cfg)
+                log(f"home ids resolved: {home_ids}")
 
             for home_id in home_ids:
                 devices_raw = get_mobile_devices(access_token, home_id)
                 devices = [normalize_presence(d) for d in devices_raw]
 
-                # 1) ZUERST state/json publishen (retained), dann Discovery (damit HA direkt Werte hat)
                 agg_topic = f"{topic_prefix}/presence/home_{home_id}"
+                agg_devices_slim = [
+                    {"id": d.get("id"), "name": d.get("name"), "state": d.get("state"), "at_home": d.get("at_home"), "_ts": d.get("_ts")}
+                    for d in devices
+                ]
                 mpub.publish_json(
                     agg_topic,
-                    {"home_id": home_id, "devices": devices, "_ts": now_iso()},
+                    {"home_id": home_id, "devices": agg_devices_slim, "_ts": now_iso()},
                     retain=True,
                 )
 
@@ -870,39 +630,17 @@ def main() -> None:
                         continue
                     base = f"{topic_prefix}/presence/home_{home_id}/device_{did}"
                     mpub.publish_json(base + "/json", d, retain=True)
-                    mpub.publish(base + "/state", d["state"], retain=True)
+                    mpub.publish(base + "/state", str(d.get("state") or "unknown"), retain=True)
 
-                # 1b) Auto-Assist (nur wenn enabled=true)
-                if aa_cfg.get("enabled"):
-                    auto_assist_geofencing_tick(
-                        access_token=access_token,
-                        home_id=home_id,
-                        mobile_devices_raw=devices_raw,
-                        aa_cfg=aa_cfg,
-                        last_presence_lock_action=last_presence_lock_action,
-                    )
-                    if auto_assist_open_window_tick(
-                        access_token=access_token,
-                        home_id=home_id,
-                        aa_cfg=aa_cfg,
-                        ow_state=open_window_state,
-                    ):
-                        ow_dirty = True
-
-                # 2) Discovery + Cleanup
-                current_ids: set = set()
-                for dd in devices:
-                    try:
-                        current_ids.add(int(dd.get("id")))
-                    except Exception:
-                        pass
-
+                current_ids = {int(d["id"]) for d in devices if d.get("id")}
                 prev_ids = set(discovery_state["homes"].get(str(home_id), {}).get("device_ids", []))
                 removed = prev_ids - current_ids
 
                 if mpub.client:
                     if removed:
-                        discovery_cleanup_removed_devices(mpub, discovery_prefix, ha_device_id, removed)
+                        discovery_cleanup_removed_devices(
+                            mpub, discovery_prefix, ha_device_id, removed, enable_raw_sensors=enable_raw_sensors
+                        )
 
                     if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
                         publish_discovery_for_devices(
@@ -913,6 +651,7 @@ def main() -> None:
                             ha_device_id,
                             home_id,
                             devices,
+                            enable_raw_sensors=enable_raw_sensors,
                         )
                         log(f"discovery published (home={home_id}, devices={len(current_ids)})")
 
@@ -924,18 +663,13 @@ def main() -> None:
 
                 log(f"presence updated home={home_id} devices={len(devices)}")
 
-            if ow_dirty:
-                save_open_window_state(open_window_state)
-
-        except RateLimitError as e:
-            ra = int(e.retry_after or 60)
-            sleep_seconds = max(poll, ra)
-            log(f"ERROR: {e} (rate limited) -> sleep {sleep_seconds}s")
-
         except Exception as e:
-            log(f"ERROR: {e}")
+            msg = str(e)
+            log(f"ERROR: {msg}")
+            if home_ids is None and "status=429" in msg:
+                time.sleep(60)
 
-        time.sleep(sleep_seconds)
+        time.sleep(poll)
 
 
 if __name__ == "__main__":
