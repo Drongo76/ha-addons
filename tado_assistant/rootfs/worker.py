@@ -18,6 +18,7 @@ except Exception:
 # -----------------------------
 DATA_DIR = "/data"
 OPTIONS_PATH = "/data/options.json"
+CACHE_DIR = DATA_DIR  # use /data for any persistent worker state
 
 TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
@@ -330,16 +331,52 @@ class RateLimitError(Exception):
         self.retry_after = retry_after
 
 
-def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
-    url = f"{API_BASE}{path}"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-    resp_headers = {k: v for k, v in r.headers.items()}
+def _is_token_expired_payload(data: Any) -> bool:
+    # Tado returns: {"errors":[{"code":"unauthorized","title":"access token is expired"}]}
     try:
-        data = r.json()
+        if isinstance(data, dict) and isinstance(data.get("errors"), list):
+            for e in data["errors"]:
+                if not isinstance(e, dict):
+                    continue
+                code = str(e.get("code", "")).lower()
+                title = str(e.get("title", "")).lower()
+                if code == "unauthorized" and "access token is expired" in title:
+                    return True
     except Exception:
-        data = r.text
-    return r.status_code, data, resp_headers
+        pass
+    return False
+
+
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
+    """Call Tado API and (once) auto-refresh token if we get 401 'access token is expired'."""
+    url = f"{API_BASE}{path}"
+
+    def _do_request(tok: str) -> Tuple[int, Any, Dict[str, str]]:
+        headers = {"Authorization": f"Bearer {tok}"}
+        r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+        resp_headers = {k: v for k, v in r.headers.items()}
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+        return r.status_code, data, resp_headers
+
+    status, data, resp_headers = _do_request(access_token)
+
+    # auto-refresh (once) on expired token
+    if status == 401 and _is_token_expired_payload(data):
+        try:
+            tokens = read_json(TOKENS_PATH)
+            if isinstance(tokens, dict) and tokens.get("refresh_token"):
+                log("token expired -> refreshing and retrying once")
+                tokens = refresh_tokens(tokens)
+                status, data, resp_headers = _do_request(str(tokens.get("access_token", "")))
+            else:
+                log("token expired but refresh_token missing -> login again via Ingress")
+        except Exception as e:
+            log(f"token refresh failed: {e}")
+
+    return status, data, resp_headers
 
 
 def parse_retry_after(headers: Dict[str, str]) -> Optional[int]:
@@ -751,7 +788,7 @@ def publish_discovery_for_devices(
 
 
 
-OPEN_WINDOW_DISCOVERY_STATE_PATH = os.path.join(CACHE_DIR, "open_window_discovery_state.json")
+OPEN_WINDOW_DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "open_window_discovery_state.json")
 
 
 def _load_open_window_discovery_state() -> Dict[str, Any]:
