@@ -17,11 +17,7 @@ DATA_DIR = "/data"
 TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 LAST_TOKEN_RESP_PATH = os.path.join(DATA_DIR, "tado_assistant_last_token_response.json")
 OPTIONS_PATH = os.path.join(DATA_DIR, "options.json")
-
-# Merkt sich, welche Device-IDs wir zuletzt per Discovery veröffentlicht haben (pro home)
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
-
-# Cache für Home-IDs (damit wir /me NICHT ständig aufrufen -> 429)
 HOME_IDS_CACHE_PATH = os.path.join(DATA_DIR, "tado_assistant_home_ids_cache.json")
 
 # ===== Tado OAuth + API =====
@@ -34,11 +30,12 @@ DEFAULT_POLL_SECONDS = 30
 TOKEN_REFRESH_SAFETY_SECONDS = 90
 HTTP_TIMEOUT = 20
 
-# Discovery republish (falls HA/retained mal „verschluckt“ wurde)
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
-
-# Home-IDs Cache TTL (sek). Wenn abgelaufen, versuchen wir EINMAL /me – aber nutzen alten Cache als Fallback.
 HOME_IDS_CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 Tage
+
+# Rate limit backoff
+RATE_LIMIT_BACKOFF_START = 60          # 1 min
+RATE_LIMIT_BACKOFF_MAX = 30 * 60       # 30 min
 
 
 def now_iso() -> str:
@@ -69,12 +66,6 @@ def write_json_atomic(path: str, obj: Any) -> None:
 
 
 def _parse_int_list(val: Any) -> List[int]:
-    """
-    Akzeptiert:
-      - int
-      - list[int|str]
-      - str: "1,2,3"
-    """
     out: List[int] = []
     if val is None:
         return out
@@ -136,8 +127,6 @@ def load_config() -> Dict[str, Any]:
     ha_device_name = opt.get("ha_device_name") or "Tado Assistant"
     ha_device_id = opt.get("ha_device_id") or "tado_assistant"
 
-    # Optional: Home IDs fix/override, damit wir /me gar nicht brauchen.
-    # Unterstützte Keys: tado_home_id, tado_home_ids, home_ids
     override = (
         opt.get("tado_home_ids")
         if "tado_home_ids" in opt
@@ -148,10 +137,7 @@ def load_config() -> Dict[str, Any]:
     home_ids_override = sorted(list(set(_parse_int_list(override))))
 
     enable_raw_sensors = opt.get("enable_raw_sensors")
-    if enable_raw_sensors is None:
-        enable_raw_sensors = True
-    else:
-        enable_raw_sensors = bool(enable_raw_sensors)
+    enable_raw_sensors = True if enable_raw_sensors is None else bool(enable_raw_sensors)
 
     return {
         "poll_seconds": poll,
@@ -238,6 +224,13 @@ def refresh_tokens(tokens: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str
     return False, f"refresh failed: {err or data}", None
 
 
+class RateLimitError(Exception):
+    def __init__(self, path: str, retry_after: Optional[int]):
+        super().__init__(f"rate_limited path={path} retry_after={retry_after}")
+        self.path = path
+        self.retry_after = retry_after
+
+
 class MqttPub:
     def __init__(self, mqtt_cfg: Dict[str, Any]) -> None:
         self.cfg = mqtt_cfg or {}
@@ -257,11 +250,9 @@ class MqttPub:
         username = self.cfg.get("username")
         password = self.cfg.get("password")
         tls = bool(self.cfg.get("tls", False))
-
         client_id = self.cfg.get("client_id") or f"tado_assistant_{int(time.time())}"
 
         c = mqtt.Client(client_id=client_id, clean_session=True)
-
         if username:
             c.username_pw_set(username, password=password)
         if tls:
@@ -293,17 +284,34 @@ class MqttPub:
         self.publish(topic, "", retain=True)
 
 
-def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any]:
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any, Optional[int]]:
     url = f"{API_BASE}{path}"
-    headers = {"Authorization": f"Bearer {access_token}"}
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "TadoAssistantHA/1.0",
+    }
     try:
         r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
     except Exception as e:
-        return 0, f"request failed: {e}"
+        return 0, f"request failed: {e}", None
+
+    retry_after = None
     try:
-        return r.status_code, r.json()
+        ra = r.headers.get("Retry-After")
+        if ra:
+            retry_after = int(ra)
     except Exception:
-        return r.status_code, r.text
+        retry_after = None
+
+    try:
+        data = r.json()
+    except Exception:
+        data = r.text
+
+    if r.status_code == 429:
+        raise RateLimitError(path=path, retry_after=retry_after)
+
+    return r.status_code, data, retry_after
 
 
 def ensure_valid_tokens() -> Dict[str, Any]:
@@ -362,8 +370,22 @@ def _write_home_ids_cache(home_ids: List[int]) -> None:
     )
 
 
+def load_discovery_state() -> Dict[str, Any]:
+    st = read_json(DISCOVERY_STATE_PATH)
+    if not isinstance(st, dict):
+        return {"homes": {}}
+    st.setdefault("homes", {})
+    if not isinstance(st["homes"], dict):
+        st["homes"] = {}
+    return st
+
+
+def save_discovery_state(st: Dict[str, Any]) -> None:
+    write_json_atomic(DISCOVERY_STATE_PATH, st)
+
+
 def resolve_home_ids(access_token: str, discovery_state: Dict[str, Any], cfg: Dict[str, Any]) -> List[int]:
-    # 0) Override aus options.json
+    # 0) Override: verhindert /me komplett
     override = cfg.get("home_ids_override") or []
     if override:
         _write_home_ids_cache(override)
@@ -372,30 +394,28 @@ def resolve_home_ids(access_token: str, discovery_state: Dict[str, Any], cfg: Di
 
     # 1) Cache
     cached_ids, cached_at = _read_home_ids_cache()
-    cache_age = (int(time.time()) - cached_at) if cached_ids and cached_at else None
-    if cached_ids and cache_age is not None and cache_age <= HOME_IDS_CACHE_TTL_SECONDS:
-        return cached_ids
+    if cached_ids and cached_at:
+        age = int(time.time()) - int(cached_at)
+        if age <= HOME_IDS_CACHE_TTL_SECONDS:
+            return cached_ids
 
-    # 2) Discovery-State
-    try:
-        homes = discovery_state.get("homes")
-        if isinstance(homes, dict) and homes:
-            ids = []
-            for k in homes.keys():
-                try:
-                    ids.append(int(k))
-                except Exception:
-                    continue
-            ids = sorted(list(set(ids)))
-            if ids:
-                _write_home_ids_cache(ids)
-                log(f"home ids: using from discovery_state: {ids}")
-                return ids
-    except Exception:
-        pass
+    # 2) Discovery-State (wenn vorhanden)
+    homes = discovery_state.get("homes")
+    if isinstance(homes, dict) and homes:
+        ids = []
+        for k in homes.keys():
+            try:
+                ids.append(int(k))
+            except Exception:
+                continue
+        ids = sorted(list(set(ids)))
+        if ids:
+            _write_home_ids_cache(ids)
+            log(f"home ids: using from discovery_state: {ids}")
+            return ids
 
-    # 3) /me (nur wenn wir GAR nichts haben)
-    status, data = api_request("GET", "/me", access_token)
+    # 3) /me (letzter Ausweg)
+    status, data, _ = api_request("GET", "/me", access_token)
     if status == 200:
         ids = _extract_home_ids_from_me(data)
         if not ids:
@@ -403,7 +423,6 @@ def resolve_home_ids(access_token: str, discovery_state: Dict[str, Any], cfg: Di
         _write_home_ids_cache(ids)
         return ids
 
-    # 4) Fallback: alter Cache auch wenn TTL abgelaufen ist
     if cached_ids:
         log(f"WARN: /me failed status={status}. Using stale cache home_ids={cached_ids}")
         return cached_ids
@@ -412,7 +431,7 @@ def resolve_home_ids(access_token: str, discovery_state: Dict[str, Any], cfg: Di
 
 
 def get_mobile_devices(access_token: str, home_id: int) -> list:
-    status, data = api_request("GET", f"/homes/{home_id}/mobileDevices", access_token)
+    status, data, _ = api_request("GET", f"/homes/{home_id}/mobileDevices", access_token)
     if status != 200:
         raise RuntimeError(f"/homes/{home_id}/mobileDevices failed status={status} data={data}")
     return data if isinstance(data, list) else []
@@ -428,7 +447,6 @@ def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
     elif "atHome" in device:
         at_home = device.get("atHome")
 
-    # HA device_tracker: "home" / "not_home"
     if isinstance(at_home, bool):
         state = "home" if at_home else "not_home"
     else:
@@ -484,7 +502,7 @@ def publish_discovery_for_devices(
         state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did}/state"
         json_attr_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did}/json"
 
-        # Device Tracker (statt binary_sensor)
+        # Device Tracker
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
             "name": f"Tado Presence {name}",
@@ -535,42 +553,6 @@ def publish_discovery_for_devices(
         mpub.publish_json(agg_config_topic, agg_payload, retain=True)
 
 
-def discovery_cleanup_removed_devices(
-    mpub: MqttPub,
-    discovery_prefix: str,
-    ha_device_id: str,
-    removed_device_ids: set,
-    enable_raw_sensors: bool,
-) -> None:
-    if not mpub.client:
-        return
-    for did in sorted(list(removed_device_ids)):
-        tracker_object_id, raw_object_id = discovery_object_ids(ha_device_id, int(did))
-
-        tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
-        mpub.publish_delete_retained(tracker_config_topic)
-
-        if enable_raw_sensors:
-            raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
-            mpub.publish_delete_retained(raw_config_topic)
-
-        log(f"discovery cleanup: removed device_id={did}")
-
-
-def load_discovery_state() -> Dict[str, Any]:
-    st = read_json(DISCOVERY_STATE_PATH)
-    if not isinstance(st, dict):
-        return {"homes": {}}
-    st.setdefault("homes", {})
-    if not isinstance(st["homes"], dict):
-        st["homes"] = {}
-    return st
-
-
-def save_discovery_state(st: Dict[str, Any]) -> None:
-    write_json_atomic(DISCOVERY_STATE_PATH, st)
-
-
 def main() -> None:
     cfg = load_config()
     poll = cfg["poll_seconds"]
@@ -593,9 +575,21 @@ def main() -> None:
     loop = 0
     home_ids: Optional[List[int]] = None
 
+    # rate limit state
+    rate_limited_until = 0.0
+    backoff = RATE_LIMIT_BACKOFF_START
+
     while True:
         loop += 1
         try:
+            # global wait if currently rate-limited
+            now = time.time()
+            if now < rate_limited_until:
+                sleep_s = int(rate_limited_until - now)
+                log(f"rate-limited: sleeping {sleep_s}s")
+                time.sleep(max(5, sleep_s))
+                continue
+
             if not tokens_exist():
                 log(f"waiting for tokens: {TOKENS_PATH} (login first)")
                 time.sleep(5)
@@ -604,7 +598,6 @@ def main() -> None:
             tokens = ensure_valid_tokens()
             access_token = tokens["access_token"]
 
-            # Home-IDs NICHT jedes Mal holen! (das verursacht 429)
             if home_ids is None:
                 home_ids = resolve_home_ids(access_token, discovery_state, cfg)
                 log(f"home ids resolved: {home_ids}")
@@ -633,41 +626,39 @@ def main() -> None:
                     mpub.publish(base + "/state", str(d.get("state") or "unknown"), retain=True)
 
                 current_ids = {int(d["id"]) for d in devices if d.get("id")}
-                prev_ids = set(discovery_state["homes"].get(str(home_id), {}).get("device_ids", []))
-                removed = prev_ids - current_ids
+                discovery_state["homes"][str(home_id)] = {
+                    "device_ids": sorted(list(current_ids)),
+                    "updated_at": now_iso(),
+                }
+                save_discovery_state(discovery_state)
 
-                if mpub.client:
-                    if removed:
-                        discovery_cleanup_removed_devices(
-                            mpub, discovery_prefix, ha_device_id, removed, enable_raw_sensors=enable_raw_sensors
-                        )
-
-                    if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
-                        publish_discovery_for_devices(
-                            mpub,
-                            discovery_prefix,
-                            topic_prefix,
-                            ha_device_name,
-                            ha_device_id,
-                            home_id,
-                            devices,
-                            enable_raw_sensors=enable_raw_sensors,
-                        )
-                        log(f"discovery published (home={home_id}, devices={len(current_ids)})")
-
-                    discovery_state["homes"][str(home_id)] = {
-                        "device_ids": sorted(list(current_ids)),
-                        "updated_at": now_iso(),
-                    }
-                    save_discovery_state(discovery_state)
+                if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
+                    publish_discovery_for_devices(
+                        mpub,
+                        discovery_prefix,
+                        topic_prefix,
+                        ha_device_name,
+                        ha_device_id,
+                        home_id,
+                        devices,
+                        enable_raw_sensors=enable_raw_sensors,
+                    )
+                    log(f"discovery published (home={home_id}, devices={len(current_ids)})")
 
                 log(f"presence updated home={home_id} devices={len(devices)}")
 
+            # reset backoff after a successful full loop
+            backoff = RATE_LIMIT_BACKOFF_START
+
+        except RateLimitError as e:
+            # backoff: Retry-After respektieren, sonst exponentiell
+            ra = e.retry_after if e.retry_after is not None else 0
+            backoff = min(max(backoff * 2, ra, RATE_LIMIT_BACKOFF_START), RATE_LIMIT_BACKOFF_MAX)
+            rate_limited_until = time.time() + backoff
+            log(f"ERROR: Tado rate limit (429) on {e.path} -> backoff {backoff}s")
+
         except Exception as e:
-            msg = str(e)
-            log(f"ERROR: {msg}")
-            if home_ids is None and "status=429" in msg:
-                time.sleep(60)
+            log(f"ERROR: {e}")
 
         time.sleep(poll)
 
