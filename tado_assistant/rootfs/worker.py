@@ -29,6 +29,11 @@ DEFAULT_DEVICE_NAME = "Tado Assistant"
 DEFAULT_DEVICE_ID = "tado_assistant"
 DEFAULT_POLL_SECONDS = 300  # IMPORTANT: avoid 429 by default
 
+# ===== OAuth refresh (no client_secret needed) =====
+TOKEN_URL = "https://login.tado.com/oauth2/token"
+TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
+
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -135,48 +140,46 @@ def token_expires_at(tokens: Dict[str, Any]) -> Optional[float]:
 def token_needs_refresh(tokens: Dict[str, Any], skew_s: int = 60) -> bool:
     exp_at = token_expires_at(tokens)
     if exp_at is None:
-        # can't determine; assume refresh if we have refresh_token & client creds
-        return True
+        # If we cannot determine expiry (missing obtained_at/expires_in), do NOT force refresh.
+        # We'll try the access_token and only refresh on a real 401 from the API.
+        return False
     return (time.time() + skew_s) >= exp_at
 
 
 def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
-    # Device-Code flow gave us refresh_token + client_id/client_secret (needed for refresh)
+    # Refresh using the public Home Assistant compatible client_id (NO client_secret required)
     refresh_token = tokens.get("refresh_token")
-    client_id = tokens.get("client_id")
-    client_secret = tokens.get("client_secret")
+    if not refresh_token:
+        raise RuntimeError("refresh_token missing in tokens file (login again via Ingress)")
 
-    if not (refresh_token and client_id and client_secret):
-        raise RuntimeError("refresh_token/client_id/client_secret missing in tokens file")
-
-    url = "https://auth.tado.com/oauth/token"
     data = {
         "grant_type": "refresh_token",
-        "client_id": client_id,
-        "client_secret": client_secret,
+        "client_id": TADO_CLIENT_ID,
         "refresh_token": refresh_token,
     }
 
-    r = requests.post(url, data=data, timeout=20)
+    r = requests.post(TOKEN_URL, data=data, timeout=20)
     if r.status_code >= 400:
         raise RuntimeError(f"token refresh failed: {r.status_code} {r.text[:200]}")
 
     resp = r.json()
+
     # Persist last response for debug
     try:
         write_json_atomic(LAST_TOKEN_RESP_PATH, resp)
     except Exception:
         pass
 
-    # Merge fields, keep refresh_token if not returned
     new_tokens = dict(tokens)
     new_tokens.update(resp)
+
+    # Keep refresh_token if not returned
     if not new_tokens.get("refresh_token"):
         new_tokens["refresh_token"] = refresh_token
 
-    # Set obtained_at
+    # mark obtained_at for expiry calculations
     new_tokens["obtained_at"] = time.time()
-    new_tokens["obtained_at_iso"] = now_iso()
+    new_tokens["obtained_at_iso"] = datetime.now(timezone.utc).isoformat()
 
     write_json_atomic(TOKENS_PATH, new_tokens)
     return new_tokens
@@ -185,9 +188,22 @@ def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
 def api_request(tokens: Dict[str, Any], method: str, path: str) -> Any:
     base = "https://my.tado.com/api/v2"
     url = base + path
-    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
 
-    r = requests.request(method, url, headers=headers, timeout=30)
+    def do_req(tok: Dict[str, Any]) -> requests.Response:
+        headers = {"Authorization": f"Bearer {tok['access_token']}"}
+        return requests.request(method, url, headers=headers, timeout=30)
+
+    r = do_req(tokens)
+
+    if r.status_code == 401 and not tokens.get("refresh_token"):
+        raise RuntimeError("Tado API 401 (token expired) and refresh_token missing -> login again via Ingress")
+
+    # If token expired, try one refresh + retry (only if refresh_token exists)
+    if r.status_code == 401 and tokens.get("refresh_token"):
+        log(f"API 401 on {path} -> refreshing token and retrying")
+        tokens = refresh_tokens(tokens)
+        r = do_req(tokens)
+
     if r.status_code == 429:
         # caller handles backoff
         raise requests.HTTPError("429", response=r)
@@ -201,11 +217,21 @@ def ensure_valid_tokens() -> Dict[str, Any]:
     if not tokens.get("access_token"):
         raise RuntimeError("tokens missing access_token (login again)")
 
-    # Refresh if needed
-    if token_needs_refresh(tokens):
+    # If ingress did not store obtained_at, set it so expiry checks work (best-effort).
+    if tokens.get("access_token") and not isinstance(tokens.get("obtained_at"), (int, float)):
+        tokens["obtained_at"] = time.time()
+        tokens["obtained_at_iso"] = datetime.now(timezone.utc).isoformat()
+        try:
+            write_json_atomic(TOKENS_PATH, tokens)
+        except Exception:
+            pass
+
+    # Refresh if we can and it's actually needed
+    if token_needs_refresh(tokens) and tokens.get("refresh_token"):
         log("token needs refresh -> refreshing")
         tokens = refresh_tokens(tokens)
         log("token refreshed")
+
     return tokens
 
 
