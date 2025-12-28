@@ -21,15 +21,18 @@ OPTIONS_PATH = "/data/options.json"
 
 TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
-
-# Optional cache to survive rate limits / restarts
 LAST_DEVICES_PATH = os.path.join(DATA_DIR, "tado_assistant_last_devices.json")
 
 API_BASE = "https://my.tado.com/api/v2"
-AUTH_BASE = "https://auth.tado.com/oauth/token"
+
+# ✅ Public OAuth refresh endpoint (NO client_secret needed for our flow)
+TOKEN_URL = "https://login.tado.com/oauth2/token"
+TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 HTTP_TIMEOUT = 20
 DEFAULT_POLL_SECONDS = 300
+
+DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 120
 DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS = 1800
@@ -69,6 +72,30 @@ def tokens_exist() -> bool:
     return os.path.exists(TOKENS_PATH)
 
 
+def _parse_int_list(val: Any) -> List[int]:
+    out: List[int] = []
+    if val is None:
+        return out
+    if isinstance(val, int):
+        return [val]
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        for p in parts:
+            try:
+                out.append(int(p))
+            except Exception:
+                pass
+        return out
+    if isinstance(val, list):
+        for x in val:
+            try:
+                out.append(int(x))
+            except Exception:
+                continue
+        return out
+    return out
+
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -80,13 +107,12 @@ def load_config() -> Dict[str, Any]:
         poll = int(poll)
     except Exception:
         poll = DEFAULT_POLL_SECONDS
-
     poll = max(10, poll)
 
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
     enable_raw_sensors = bool(enable_raw_sensors)
 
-    # Optional: avoid calling /me (which can trigger 429 easily)
+    # Avoid /me if set
     tado_home_ids = opt.get("tado_home_ids", opt.get("home_ids"))
     if isinstance(tado_home_ids, str):
         parts = [p.strip() for p in tado_home_ids.split(",") if p.strip()]
@@ -95,13 +121,7 @@ def load_config() -> Dict[str, Any]:
         except Exception:
             tado_home_ids = None
     if isinstance(tado_home_ids, list):
-        cleaned: List[int] = []
-        for x in tado_home_ids:
-            try:
-                cleaned.append(int(x))
-            except Exception:
-                pass
-        tado_home_ids = sorted(list(set(cleaned)))
+        tado_home_ids = sorted(list(set(_parse_int_list(tado_home_ids))))
     else:
         tado_home_ids = None
 
@@ -122,7 +142,7 @@ def load_config() -> Dict[str, Any]:
     if not isinstance(mcfg, dict):
         mcfg = {}
 
-    # flat HA UI keys (compat)
+    # flat keys
     if "mqtt_enabled" in opt:
         mcfg["enabled"] = bool(opt.get("mqtt_enabled"))
     if "mqtt_host" in opt:
@@ -212,7 +232,7 @@ class MqttPub:
             return
         self.client.publish(topic, payload, qos=0, retain=retain)
 
-    def publish_json(self, topic: str, payload: Dict[str, Any], retain: bool = True) -> None:
+    def publish_json(self, topic: str, payload: Any, retain: bool = True) -> None:
         self.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
 
     def publish_delete_retained(self, topic: str) -> None:
@@ -287,72 +307,80 @@ def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
 
 
 # -----------------------------
-# Token handling
+# Token handling (FIXED)
 # -----------------------------
-def parse_obtained_at(tokens: Dict[str, Any]) -> Optional[int]:
-    s = tokens.get("_obtained_at")
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-        return int(dt.timestamp())
-    except Exception:
-        return None
+def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
+    if "_obtained_at_epoch" in tokens:
+        try:
+            return int(tokens["_obtained_at_epoch"])
+        except Exception:
+            pass
+    for k in ("_obtained_at", "obtained_at"):
+        s = tokens.get(k)
+        if isinstance(s, str) and s:
+            try:
+                return int(datetime.fromisoformat(s).timestamp())
+            except Exception:
+                pass
+    return None
 
 
 def token_expires_at(tokens: Dict[str, Any]) -> Optional[int]:
-    obtained = parse_obtained_at(tokens)
+    obtained = _obtained_epoch(tokens)
     try:
         expires_in = int(tokens.get("expires_in"))
     except Exception:
         return None
-    if not obtained:
+    if obtained is None:
         return None
     return obtained + expires_in
 
 
 def token_is_expired(tokens: Dict[str, Any], skew_seconds: int = 60) -> bool:
     exp = token_expires_at(tokens)
-    if not exp:
+    if exp is None:
         return True
     return time.time() >= (exp - skew_seconds)
 
 
 def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
     refresh_token = tokens.get("refresh_token")
-    client_id = tokens.get("client_id")
-    client_secret = tokens.get("client_secret")
+    if not refresh_token:
+        # ✅ This is the ONLY hard requirement
+        raise RuntimeError("refresh_token missing in tokens file (login again via Ingress)")
 
-    if not refresh_token or not client_id or not client_secret:
-        raise RuntimeError("refresh_token/client_id/client_secret missing in tokens file")
-
-    data = {
+    payload = {
+        "client_id": TADO_CLIENT_ID,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": client_id,
-        "client_secret": client_secret,
     }
 
-    r = requests.post(AUTH_BASE, data=data, timeout=HTTP_TIMEOUT)
+    r = requests.post(TOKEN_URL, data=payload, timeout=HTTP_TIMEOUT)
     if r.status_code == 429:
         ra = parse_retry_after({k: v for k, v in r.headers.items()})
-        raise RateLimitError("oauth/token", ra)
+        raise RateLimitError("oauth2/token", ra)
 
     try:
-        resp = r.json()
+        data = r.json()
     except Exception:
-        resp = {"raw": r.text}
+        data = r.text
 
-    if r.status_code != 200:
-        raise RuntimeError(f"token refresh failed status={r.status_code} data={resp}")
+    if r.status_code != 200 or not (isinstance(data, dict) and data.get("access_token")):
+        raise RuntimeError(f"token refresh failed status={r.status_code} data={data}")
 
-    resp["refresh_token"] = resp.get("refresh_token") or refresh_token
-    resp["client_id"] = client_id
-    resp["client_secret"] = client_secret
-    resp["_obtained_at"] = now_iso()
-    write_json_atomic(TOKENS_PATH, resp)
+    new_tokens = dict(tokens)
+    new_tokens.update(data)
+
+    # Keep refresh_token if server did not return one
+    if not new_tokens.get("refresh_token"):
+        new_tokens["refresh_token"] = refresh_token
+
+    new_tokens["_obtained_at"] = now_iso()
+    new_tokens["_obtained_at_epoch"] = int(time.time())
+
+    write_json_atomic(TOKENS_PATH, new_tokens)
     log("Token refreshed.")
-    return resp
+    return new_tokens
 
 
 def ensure_valid_tokens() -> Dict[str, Any]:
@@ -414,9 +442,9 @@ def publish_discovery_for_devices(
         "manufacturer": "tado°",
         "model": "Tado Assistant (Ingress)",
     }
-
     availability_topic = f"{topic_prefix}/_status"
 
+    # Home raw (optional)
     if enable_raw_sensors:
         agg_object_id_new = f"{ha_device_id}_home_{home_id}_raw"
         agg_object_id_old = f"{ha_device_id}_home_{home_id}_presence"
@@ -452,9 +480,10 @@ def publish_discovery_for_devices(
         state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/state"
         raw_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/raw"
 
-        # remove old binary_sensor config (migration)
+        # remove old binary_sensor config
         mpub.publish_delete_retained(f"{discovery_prefix}/binary_sensor/{tracker_object_id}/config")
 
+        # device_tracker
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
             "name": f"Tado {name}",
@@ -471,6 +500,7 @@ def publish_discovery_for_devices(
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
         if enable_raw_sensors:
+            # remove old raw sensor id
             mpub.publish_delete_retained(f"{discovery_prefix}/sensor/{old_json_object_id}/config")
 
             raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
@@ -532,6 +562,26 @@ def publish_presence(
     write_json_atomic(LAST_DEVICES_PATH, cache)
 
 
+def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    cache = read_json(LAST_DEVICES_PATH)
+    if not isinstance(cache, dict):
+        return
+    topic_prefix = cfg["topic_prefix"]
+    enable_raw = bool(cfg.get("enable_raw_sensors", True))
+    for home_id_s, payload in cache.items():
+        try:
+            home_id = int(home_id_s)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("devices"), list):
+            devices = payload["devices"]
+            try:
+                publish_presence(mpub, topic_prefix, home_id, devices, enable_raw)
+                log(f"republished cached presence home={home_id} devices={len(devices)}")
+            except Exception:
+                pass
+
+
 def load_cached_home_ids() -> Optional[List[int]]:
     st = read_json(DISCOVERY_STATE_PATH)
     if isinstance(st, dict):
@@ -553,26 +603,6 @@ def save_cached_home_ids(home_ids: List[int]) -> None:
         st = {}
     st["home_ids"] = home_ids
     write_json_atomic(DISCOVERY_STATE_PATH, st)
-
-
-def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
-    cache = read_json(LAST_DEVICES_PATH)
-    if not isinstance(cache, dict):
-        return
-    topic_prefix = cfg["topic_prefix"]
-    enable_raw = bool(cfg.get("enable_raw_sensors", True))
-    for home_id_s, payload in cache.items():
-        try:
-            home_id = int(home_id_s)
-        except Exception:
-            continue
-        if isinstance(payload, dict) and isinstance(payload.get("devices"), list):
-            devices = payload["devices"]
-            try:
-                publish_presence(mpub, topic_prefix, home_id, devices, enable_raw)
-                log(f"republished cached presence home={home_id} devices={len(devices)}")
-            except Exception:
-                pass
 
 
 # -----------------------------
@@ -606,7 +636,10 @@ def main() -> None:
     backoff_max = int(cfg["rate_limit_backoff_max_seconds"])
     backoff_current = backoff_base
 
+    loop = 0
+
     while True:
+        loop += 1
         try:
             if not tokens_exist():
                 log(f"waiting for tokens: {TOKENS_PATH} (login first)")
@@ -624,9 +657,9 @@ def main() -> None:
             for home_id in home_ids:
                 devices_raw = get_mobile_devices(access_token, home_id)
                 devices = [normalize_presence(d) for d in devices_raw]
-
                 current_ids = {int(d["id"]) for d in devices if d.get("id") is not None}
 
+                # prev ids
                 st = read_json(DISCOVERY_STATE_PATH)
                 prev_ids: Set[int] = set()
                 if isinstance(st, dict):
@@ -640,16 +673,18 @@ def main() -> None:
                                 except Exception:
                                     pass
 
-                publish_discovery_for_devices(
-                    mpub,
-                    discovery_prefix,
-                    topic_prefix,
-                    ha_device_name,
-                    ha_device_id,
-                    home_id,
-                    devices,
-                    enable_raw_sensors,
-                )
+                # discovery only every N loops (less spam)
+                if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
+                    publish_discovery_for_devices(
+                        mpub,
+                        discovery_prefix,
+                        topic_prefix,
+                        ha_device_name,
+                        ha_device_id,
+                        home_id,
+                        devices,
+                        enable_raw_sensors,
+                    )
 
                 removed = prev_ids - current_ids
                 if removed:
@@ -682,7 +717,7 @@ def main() -> None:
 
         except Exception as e:
             log(f"ERROR: {e}")
-            time.sleep(max(5, min(poll, 30)))
+            time.sleep(10)
 
 
 if __name__ == "__main__":
