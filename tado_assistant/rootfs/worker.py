@@ -123,10 +123,10 @@ def load_config() -> Dict[str, Any]:
     enable_raw_sensors = bool(enable_raw_sensors)
 
     # Open-Window / Auto-Assist (optional)
-    enable_open_window = opt.get("enable_open_window", False)
+    enable_open_window = opt.get("enable_open_window", True)
     enable_open_window = bool(enable_open_window)
 
-    open_window_poll_seconds = opt.get("open_window_poll_seconds")
+    open_window_poll_seconds = opt.get("open_window_poll_seconds", 300)
     if open_window_poll_seconds in ("", None):
         open_window_poll_seconds = poll
     try:
@@ -740,6 +740,7 @@ def publish_discovery_for_devices(
             "state_topic": agg_topic,
             "value_template": "{{ value_json._ts }}",
             "json_attributes_topic": agg_topic,
+            "entity_category": "diagnostic",
             "device": device_block,
             "icon": "mdi:home-account",
         }
@@ -778,10 +779,12 @@ def publish_discovery_for_devices(
             raw_payload = {
                 "name": f"Tado {name} (raw)",
                 "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
-                "state_topic": state_topic,
+                "state_topic": raw_topic,
+                "value_template": "{{ value_json._ts }}",
                 "json_attributes_topic": raw_topic,
+                "entity_category": "diagnostic",
                 "device": device_block,
-                "icon": "mdi:account",
+                "icon": "mdi:code-json",
             }
             mpub.publish_json(raw_config_topic, raw_payload, retain=True)
 
@@ -841,8 +844,6 @@ def publish_open_window_discovery(
                 supported = bool(owd.get("supported"))
             if "enabled" in owd:
                 enabled = bool(owd.get("enabled"))
-        if not supported or not enabled:
-            continue
 
         node_id = ha_device_id
         object_id = f"open_window_home_{home_id}_zone_{zid_int}"
