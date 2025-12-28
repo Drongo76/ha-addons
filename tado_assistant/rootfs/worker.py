@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List, Set
+from typing import Any, Dict, Optional, Tuple, List, Set, Callable
 
 import requests
 
@@ -23,9 +23,12 @@ TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
 LAST_DEVICES_PATH = os.path.join(DATA_DIR, "tado_assistant_last_devices.json")
 
+# Auto-Assist runtime (persisted toggle + timestamps)
+AUTO_ASSIST_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_auto_assist_state.json")
+
 API_BASE = "https://my.tado.com/api/v2"
 
-# ✅ Public OAuth refresh endpoint (NO client_secret needed for our flow)
+# Public OAuth refresh endpoint (NO client_secret needed)
 TOKEN_URL = "https://login.tado.com/oauth2/token"
 TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
@@ -36,6 +39,12 @@ DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 120
 DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS = 1800
+
+
+# Auto-Assist MQTT topics
+AUTO_ASSIST_STATE_TOPIC = "auto_assist/state"   # payload: ON/OFF
+AUTO_ASSIST_SET_TOPIC = "auto_assist/set"       # payload: ON/OFF
+AUTO_ASSIST_ATTRS_TOPIC = "auto_assist/attrs"   # JSON: last_run/last_action/last_error
 
 
 # -----------------------------
@@ -187,6 +196,10 @@ class MqttPub:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg or {}
         self.client = None
+        self._on_message_cb: Optional[Callable[[str, str], None]] = None
+
+    def set_on_message(self, cb: Callable[[str, str], None]) -> None:
+        self._on_message_cb = cb
 
     def start(self) -> None:
         if mqtt is None:
@@ -220,12 +233,27 @@ class MqttPub:
         def on_disconnect(client, userdata, rc):
             log(f"MQTT disconnected rc={rc}")
 
+        def on_message(client, userdata, msg):
+            try:
+                t = msg.topic or ""
+                p = msg.payload.decode("utf-8", errors="ignore") if msg.payload else ""
+                if self._on_message_cb:
+                    self._on_message_cb(t, p)
+            except Exception:
+                pass
+
         self.client.on_connect = on_connect
         self.client.on_disconnect = on_disconnect
+        self.client.on_message = on_message
 
         log(f"MQTT connecting to {host}:{port} (tls={use_tls}, user={'yes' if username else 'no'})")
         self.client.connect(host, port, keepalive=60)
         self.client.loop_start()
+
+    def subscribe(self, topic: str) -> None:
+        if not self.client:
+            return
+        self.client.subscribe(topic)
 
     def publish(self, topic: str, payload: str, retain: bool = True) -> None:
         if not self.client:
@@ -307,7 +335,7 @@ def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
 
 
 # -----------------------------
-# Token handling (FIXED)
+# Token handling
 # -----------------------------
 def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
     if "_obtained_at_epoch" in tokens:
@@ -315,13 +343,12 @@ def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
             return int(tokens["_obtained_at_epoch"])
         except Exception:
             pass
-    for k in ("_obtained_at", "obtained_at"):
-        s = tokens.get(k)
-        if isinstance(s, str) and s:
-            try:
-                return int(datetime.fromisoformat(s).timestamp())
-            except Exception:
-                pass
+    s = tokens.get("_obtained_at")
+    if isinstance(s, str) and s:
+        try:
+            return int(datetime.fromisoformat(s).timestamp())
+        except Exception:
+            return None
     return None
 
 
@@ -346,7 +373,6 @@ def token_is_expired(tokens: Dict[str, Any], skew_seconds: int = 60) -> bool:
 def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
-        # ✅ This is the ONLY hard requirement
         raise RuntimeError("refresh_token missing in tokens file (login again via Ingress)")
 
     payload = {
@@ -371,7 +397,6 @@ def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
     new_tokens = dict(tokens)
     new_tokens.update(data)
 
-    # Keep refresh_token if server did not return one
     if not new_tokens.get("refresh_token"):
         new_tokens["refresh_token"] = refresh_token
 
@@ -394,7 +419,89 @@ def ensure_valid_tokens() -> Dict[str, Any]:
 
 
 # -----------------------------
-# Presence normalization / publish
+# Auto-Assist runtime state + MQTT entity
+# -----------------------------
+def load_auto_assist_state() -> Dict[str, Any]:
+    st = read_json(AUTO_ASSIST_STATE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    # Default OFF
+    st.setdefault("enabled", False)
+    st.setdefault("last_run", None)
+    st.setdefault("last_action", None)
+    st.setdefault("last_error", None)
+    return st
+
+
+def save_auto_assist_state(st: Dict[str, Any]) -> None:
+    write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+
+
+def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+    topic_prefix = cfg["topic_prefix"]
+    enabled = bool(st.get("enabled"))
+
+    mpub.publish(f"{topic_prefix}/{AUTO_ASSIST_STATE_TOPIC}", "ON" if enabled else "OFF", retain=True)
+    mpub.publish_json(
+        f"{topic_prefix}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        {
+            "enabled": enabled,
+            "last_run": st.get("last_run"),
+            "last_action": st.get("last_action"),
+            "last_error": st.get("last_error"),
+            "_ts": now_iso(),
+        },
+        retain=True,
+    )
+
+
+def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+
+    discovery_prefix = cfg["discovery_prefix"]
+    topic_prefix = cfg["topic_prefix"]
+    ha_device_name = cfg["ha_device_name"]
+    ha_device_id = cfg["ha_device_id"]
+
+    device_block = {
+        "identifiers": [ha_device_id],
+        "name": ha_device_name,
+        "manufacturer": "tado°",
+        "model": "Tado Assistant (Ingress)",
+    }
+
+    availability_topic = f"{topic_prefix}/_status"
+
+    object_id = f"{ha_device_id}_auto_assist"
+    config_topic = f"{discovery_prefix}/switch/{object_id}/config"
+
+    payload = {
+        "name": "Tado Assistant Auto-Assist",
+        "unique_id": f"{ha_device_id}_auto_assist_switch",
+        "state_topic": f"{topic_prefix}/{AUTO_ASSIST_STATE_TOPIC}",
+        "command_topic": f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "state_on": "ON",
+        "state_off": "OFF",
+        "optimistic": False,
+        "retain": True,
+        "availability_topic": availability_topic,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "json_attributes_topic": f"{topic_prefix}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        "device": device_block,
+        "icon": "mdi:robot",
+    }
+
+    mpub.publish_json(config_topic, payload, retain=True)
+
+
+# -----------------------------
+# Presence normalization / publish + discovery
 # -----------------------------
 def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
     name = device.get("name") or device.get("deviceName") or device.get("model") or "unknown"
@@ -623,9 +730,47 @@ def main() -> None:
     mpub = MqttPub(cfg["mqtt"])
     mpub.start()
 
+    # Auto-Assist state (default OFF)
+    aa_state = load_auto_assist_state()
+
+    # MQTT command handler for Auto-Assist switch
+    def handle_mqtt_message(topic: str, payload: str) -> None:
+        nonlocal aa_state
+        # We only care about our switch command topic
+        wanted = f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}"
+        if topic != wanted:
+            return
+
+        cmd = (payload or "").strip().upper()
+        if cmd not in ("ON", "OFF"):
+            aa_state["last_error"] = f"invalid command payload: '{payload}'"
+            aa_state["last_action"] = "reject_command"
+            aa_state["last_run"] = now_iso()
+            save_auto_assist_state(aa_state)
+            publish_auto_assist(mpub, cfg, aa_state)
+            return
+
+        aa_state["enabled"] = (cmd == "ON")
+        aa_state["last_action"] = "switch_on" if aa_state["enabled"] else "switch_off"
+        aa_state["last_error"] = None
+        aa_state["last_run"] = now_iso()
+        save_auto_assist_state(aa_state)
+        publish_auto_assist(mpub, cfg, aa_state)
+        log(f"Auto-Assist switched {cmd}")
+
+    mpub.set_on_message(handle_mqtt_message)
+
     if mpub.client:
+        # availability
         mpub.publish(f"{topic_prefix}/_status", "online", retain=True)
         log(f"status published: {topic_prefix}/_status = online")
+
+        # publish discovery for Auto-Assist switch + current state/attrs
+        publish_auto_assist_discovery(mpub, cfg)
+        publish_auto_assist(mpub, cfg, aa_state)
+
+        # subscribe to command topic
+        mpub.subscribe(f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}")
 
     republish_from_cache(mpub, cfg)
 
@@ -673,7 +818,7 @@ def main() -> None:
                                 except Exception:
                                     pass
 
-                # discovery only every N loops (less spam)
+                # discovery every N loops
                 if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
                     publish_discovery_for_devices(
                         mpub,
@@ -685,6 +830,8 @@ def main() -> None:
                         devices,
                         enable_raw_sensors,
                     )
+                    # also republish Auto-Assist discovery sometimes
+                    publish_auto_assist_discovery(mpub, cfg)
 
                 removed = prev_ids - current_ids
                 if removed:
@@ -701,6 +848,16 @@ def main() -> None:
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
 
+            # ---- Auto-Assist tick marker (only metadata for now) ----
+            # (Real actions bauen wir als nächsten Schritt sauber ein.)
+            aa_state = load_auto_assist_state()
+            if aa_state.get("enabled") is True:
+                aa_state["last_run"] = now_iso()
+                aa_state["last_action"] = "tick"
+                aa_state["last_error"] = None
+                save_auto_assist_state(aa_state)
+                publish_auto_assist(mpub, cfg, aa_state)
+
             backoff_current = backoff_base
             time.sleep(poll)
 
@@ -716,6 +873,17 @@ def main() -> None:
             time.sleep(sleep_s)
 
         except Exception as e:
+            # store last_error on Auto-Assist attrs (so you SEE it in HA)
+            try:
+                aa_state = load_auto_assist_state()
+                aa_state["last_run"] = now_iso()
+                aa_state["last_error"] = str(e)
+                aa_state["last_action"] = "error"
+                save_auto_assist_state(aa_state)
+                publish_auto_assist(mpub, cfg, aa_state)
+            except Exception:
+                pass
+
             log(f"ERROR: {e}")
             time.sleep(10)
 
