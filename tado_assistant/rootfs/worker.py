@@ -3,102 +3,145 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, Optional, Tuple, List, Set, Callable
 
 import requests
 
 try:
-    import paho.mqtt.client as mqtt  # type: ignore
+    import paho.mqtt.client as mqtt
 except Exception:
     mqtt = None  # type: ignore
 
 
-TOKENS_PATH = "/data/tado_assistant_tokens.json"
-CACHE_DIR = "/data/cache"
+# -----------------------------
+# Paths / constants
+# -----------------------------
+DATA_DIR = "/data"
+OPTIONS_PATH = "/data/options.json"
 
-AUTO_ASSIST_STATE_PATH = "/data/auto_assist_state.json"
-DISCOVERY_STATE_PATH = os.path.join(CACHE_DIR, "discovery_state.json")
+TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
+DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
+LAST_DEVICES_PATH = os.path.join(DATA_DIR, "tado_assistant_last_devices.json")
+
+# Auto-Assist runtime (enabled is forced OFF on every boot)
+AUTO_ASSIST_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_auto_assist_state.json")
+
+API_BASE = "https://my.tado.com/api/v2"
+
+# Public OAuth refresh endpoint (NO client_secret needed)
+TOKEN_URL = "https://login.tado.com/oauth2/token"
+TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
+
+HTTP_TIMEOUT = 20
+DEFAULT_POLL_SECONDS = 300
+
+DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
+
+DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 120
+DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS = 1800
 
 
-DEFAULT_OPTIONS_PATHS = [
-    "/data/options.json",  # HA add-on standard
-    "/data/config.json",
-]
+# Auto-Assist MQTT topics (relative to topic_prefix)
+AUTO_ASSIST_STATE_TOPIC = "auto_assist/state"   # payload: ON/OFF
+AUTO_ASSIST_SET_TOPIC = "auto_assist/set"       # payload: ON/OFF
+AUTO_ASSIST_ATTRS_TOPIC = "auto_assist/attrs"   # JSON: last_run/last_action/last_error
 
 
+# -----------------------------
+# Small helpers
+# -----------------------------
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def log(msg: str) -> None:
     print(f"[worker] {msg}", flush=True)
 
 
-def read_json(path: str) -> Optional[Dict[str, Any]]:
+def read_json(path: str) -> Optional[Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"WARN: cannot read json {path}: {e}")
         return None
 
 
 def write_json_atomic(path: str, obj: Any) -> None:
-    tmp = f"{path}.tmp"
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+        json.dump(obj, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
-
-
-def load_options() -> Dict[str, Any]:
-    for p in DEFAULT_OPTIONS_PATHS:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-    return {}
 
 
 def tokens_exist() -> bool:
     return os.path.exists(TOKENS_PATH)
 
 
-class RateLimitError(Exception):
-    def __init__(self, path: str, retry_after: Optional[int]):
-        super().__init__(f"rate limit on {path}")
-        self.path = path
-        self.retry_after = retry_after
+def _parse_int_list(val: Any) -> List[int]:
+    out: List[int] = []
+    if val is None:
+        return out
+    if isinstance(val, int):
+        return [val]
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        for p in parts:
+            try:
+                out.append(int(p))
+            except Exception:
+                pass
+        return out
+    if isinstance(val, list):
+        for x in val:
+            try:
+                out.append(int(x))
+            except Exception:
+                continue
+        return out
+    return out
 
 
-def parse_retry_after(headers: Dict[str, Any]) -> Optional[int]:
-    ra = headers.get("Retry-After")
-    if ra is None:
-        return None
-    try:
-        return int(str(ra).strip())
-    except Exception:
-        return None
-
-
+# -----------------------------
+# Config
+# -----------------------------
 def load_config() -> Dict[str, Any]:
-    opt = load_options()
+    opt = read_json(OPTIONS_PATH) or {}
 
-    poll = opt.get("poll_seconds", opt.get("poll", 30))
+    poll = opt.get("poll_seconds", opt.get("poll_interval", DEFAULT_POLL_SECONDS))
     try:
         poll = int(poll)
     except Exception:
-        poll = 30
+        poll = DEFAULT_POLL_SECONDS
     poll = max(10, poll)
 
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
     enable_raw_sensors = bool(enable_raw_sensors)
 
-    enable_open_window = opt.get("enable_open_window", True)
+    # Open-Window / Auto-Assist (optional)
+    enable_open_window = opt.get("enable_open_window", False)
     enable_open_window = bool(enable_open_window)
 
-    max_open_window_duration = opt.get("max_open_window_duration", opt.get("max_open_window_seconds"))
+    open_window_poll_seconds = opt.get("open_window_poll_seconds")
+    if open_window_poll_seconds in ("", None):
+        open_window_poll_seconds = poll
+    try:
+        open_window_poll_seconds = int(open_window_poll_seconds)
+    except Exception:
+        open_window_poll_seconds = poll
+    open_window_poll_seconds = max(10, open_window_poll_seconds)
+
+    zones_refresh_seconds = opt.get("zones_refresh_seconds", 3600)
+    try:
+        zones_refresh_seconds = int(zones_refresh_seconds)
+    except Exception:
+        zones_refresh_seconds = 3600
+    zones_refresh_seconds = max(300, zones_refresh_seconds)
+
+    max_open_window_duration = opt.get("max_open_window_duration")
     if max_open_window_duration in ("", None):
         max_open_window_duration = None
     else:
@@ -109,32 +152,29 @@ def load_config() -> Dict[str, Any]:
     if isinstance(max_open_window_duration, int) and max_open_window_duration <= 0:
         max_open_window_duration = None
 
-    # Optional: explicitly set home ids
     tado_home_ids = opt.get("tado_home_ids", opt.get("home_ids"))
+    if isinstance(tado_home_ids, str):
+        parts = [p.strip() for p in tado_home_ids.split(",") if p.strip()]
+        try:
+            tado_home_ids = [int(p) for p in parts]
+        except Exception:
+            tado_home_ids = None
     if isinstance(tado_home_ids, list):
-        try:
-            tado_home_ids = [int(x) for x in tado_home_ids]
-        except Exception:
-            tado_home_ids = None
-    elif tado_home_ids in ("", None):
-        tado_home_ids = None
+        tado_home_ids = sorted(list(set(_parse_int_list(tado_home_ids))))
     else:
-        try:
-            tado_home_ids = [int(tado_home_ids)]
-        except Exception:
-            tado_home_ids = None
+        tado_home_ids = None
 
-    rate_backoff = opt.get("rate_limit_backoff_seconds", 60)
-    rate_backoff_max = opt.get("rate_limit_backoff_max_seconds", 600)
+    rate_backoff = opt.get("rate_limit_backoff_seconds", DEFAULT_RATE_LIMIT_BACKOFF_SECONDS)
+    rate_backoff_max = opt.get("rate_limit_backoff_max_seconds", DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS)
     try:
         rate_backoff = int(rate_backoff)
     except Exception:
-        rate_backoff = 60
+        rate_backoff = DEFAULT_RATE_LIMIT_BACKOFF_SECONDS
     try:
         rate_backoff_max = int(rate_backoff_max)
     except Exception:
-        rate_backoff_max = 600
-    rate_backoff = max(10, rate_backoff)
+        rate_backoff_max = DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS
+    rate_backoff = max(5, rate_backoff)
     rate_backoff_max = max(rate_backoff, rate_backoff_max)
 
     mcfg = opt.get("mqtt", {})
@@ -163,13 +203,15 @@ def load_config() -> Dict[str, Any]:
     discovery_prefix = opt.get("mqtt_discovery_prefix") or opt.get("discovery_prefix") or "homeassistant"
     discovery_prefix = str(discovery_prefix).strip().strip("/")
 
-    ha_device_name = opt.get("ha_device_name") or "Tado Assistant (Ingress)"
+    ha_device_name = opt.get("ha_device_name") or "Tado Assistant"
     ha_device_id = opt.get("ha_device_id") or "tado_assistant"
 
     return {
         "poll_seconds": poll,
         "enable_raw_sensors": enable_raw_sensors,
         "enable_open_window": enable_open_window,
+        "open_window_poll_seconds": open_window_poll_seconds,
+        "zones_refresh_seconds": zones_refresh_seconds,
         "max_open_window_duration": max_open_window_duration,
         "tado_home_ids": tado_home_ids,
         "rate_limit_backoff_seconds": rate_backoff,
@@ -188,303 +230,440 @@ def load_config() -> Dict[str, Any]:
 # -----------------------------
 class MqttPub:
     def __init__(self, cfg: Dict[str, Any]):
-        self.cfg = cfg
+        self.cfg = cfg or {}
         self.client = None
-        self.connected = False
-        self.last_will_set = False
-        self._subscriptions: Dict[str, Callable[[str, str], None]] = {}
+        self._on_message_cb: Optional[Callable[[str, str], None]] = None
+        self._on_connect_cb: Optional[Callable[[], None]] = None
 
-    def connect(self) -> None:
-        mcfg = self.cfg.get("mqtt", {})
-        if not isinstance(mcfg, dict):
-            mcfg = {}
-        enabled = bool(mcfg.get("enabled", True))
-        if not enabled:
-            log("MQTT disabled by config")
+    def set_on_message(self, cb: Callable[[str, str], None]) -> None:
+        self._on_message_cb = cb
+
+    def set_on_connect(self, cb: Callable[[], None]) -> None:
+        self._on_connect_cb = cb
+
+    def start(self, lwt_topic: Optional[str] = None) -> None:
+        if mqtt is None:
+            log("WARN: paho-mqtt not available, MQTT disabled")
             return
 
-        if mqtt is None:
-            raise RuntimeError("paho-mqtt not installed")
+        enabled = self.cfg.get("enabled", True)
+        if not enabled:
+            log("MQTT disabled in config")
+            return
 
-        host = str(mcfg.get("host") or os.getenv("MQTT_HOST") or "core-mosquitto")
-        port = int(mcfg.get("port") or os.getenv("MQTT_PORT") or 1883)
-        username = mcfg.get("username") or os.getenv("MQTT_USERNAME")
-        password = mcfg.get("password") or os.getenv("MQTT_PASSWORD")
-        tls = bool(mcfg.get("tls", False))
+        host = self.cfg.get("host") or "core-mosquitto"
+        port = int(self.cfg.get("port") or 1883)
+        username = self.cfg.get("username")
+        password = self.cfg.get("password")
+        use_tls = bool(self.cfg.get("tls", False))
+        client_id = self.cfg.get("client_id") or f"tado_assistant_{int(time.time())}"
 
-        client_id = mcfg.get("client_id") or f"{self.cfg.get('ha_device_id','tado_assistant')}_{int(time.time())}"
+        self.client = mqtt.Client(client_id=client_id, clean_session=True)
 
-        log(f"MQTT connecting to {host}:{port} (tls={tls}, user={'yes' if username else 'no'})")
-
-        c = mqtt.Client(client_id=client_id, clean_session=True)
+        if lwt_topic:
+            try:
+                self.client.will_set(lwt_topic, payload="offline", qos=0, retain=True)
+            except Exception as e:
+                log(f"WARN: cannot set MQTT LWT: {e}")
 
         if username:
-            c.username_pw_set(str(username), str(password) if password is not None else None)
+            self.client.username_pw_set(str(username), str(password or ""))
 
-        if tls:
-            c.tls_set()
+        if use_tls:
+            try:
+                self.client.tls_set()
+            except Exception as e:
+                log(f"WARN: cannot enable MQTT TLS: {e}")
 
         def on_connect(client, userdata, flags, rc):
-            self.connected = (rc == 0)
             log(f"MQTT connected rc={rc}")
+            if self._on_connect_cb:
+                try:
+                    self._on_connect_cb()
+                except Exception as e:
+                    log(f"WARN: on_connect callback failed: {e}")
 
         def on_disconnect(client, userdata, rc):
-            self.connected = False
             log(f"MQTT disconnected rc={rc}")
 
         def on_message(client, userdata, msg):
             try:
-                topic = msg.topic
-                payload = msg.payload.decode("utf-8", errors="ignore")
-                cb = self._subscriptions.get(topic)
-                if cb:
-                    cb(topic, payload)
-            except Exception as e:
-                log(f"ERROR on_message: {e}")
+                t = msg.topic or ""
+                p = msg.payload.decode("utf-8", errors="ignore") if msg.payload else ""
+                if self._on_message_cb:
+                    self._on_message_cb(t, p)
+            except Exception:
+                pass
 
-        c.on_connect = on_connect
-        c.on_disconnect = on_disconnect
-        c.on_message = on_message
+        self.client.on_connect = on_connect
+        self.client.on_disconnect = on_disconnect
+        self.client.on_message = on_message
 
-        # LWT
-        status_topic = f"{self.cfg['topic_prefix']}/_status"
-        c.will_set(status_topic, payload="offline", qos=1, retain=True)
-        self.last_will_set = True
+        log(f"MQTT connecting to {host}:{port} (tls={use_tls}, user={'yes' if username else 'no'})")
+        self.client.connect(host, port, keepalive=60)
+        self.client.loop_start()
 
-        c.connect(host, port, keepalive=60)
-        c.loop_start()
-
-        self.client = c
-
-        # publish online immediately (retain)
-        self.publish(status_topic, "online", retain=True)
-        log(f"status published: {status_topic} = online")
-
-    def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 1) -> None:
+    def subscribe(self, topic: str) -> None:
         if not self.client:
             return
-        self.client.publish(topic, payload=payload, qos=qos, retain=retain)
+        self.client.subscribe(topic)
 
-    def publish_json(self, topic: str, obj: Any, retain: bool = False, qos: int = 1) -> None:
-        payload = json.dumps(obj, ensure_ascii=False)
-        self.publish(topic, payload, retain=retain, qos=qos)
-
-    def subscribe(self, topic: str, callback: Callable[[str, str], None]) -> None:
+    def publish(self, topic: str, payload: str, retain: bool = True) -> None:
         if not self.client:
             return
-        self._subscriptions[topic] = callback
-        self.client.subscribe(topic, qos=1)
+        self.client.publish(topic, payload, qos=0, retain=retain)
+
+    def publish_json(self, topic: str, payload: Any, retain: bool = True) -> None:
+        self.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
+
+    def publish_delete_retained(self, topic: str) -> None:
+        self.publish(topic, "", retain=True)
 
 
 # -----------------------------
-# HTTP / Tado
+# Tado API
 # -----------------------------
-def tado_base_url() -> str:
-    return os.getenv("TADO_API_BASE_URL", "https://my.tado.com").rstrip("/")
+class RateLimitError(Exception):
+    def __init__(self, path: str, retry_after: Optional[int] = None):
+        super().__init__(path)
+        self.path = path
+        self.retry_after = retry_after
 
 
-def api_request(method: str, path: str, access_token: str, json_body: Any = None) -> Tuple[int, Any, Dict[str, Any]]:
-    url = f"{tado_base_url()}{path}"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "User-Agent": "tado-assistant/1.0",
-    }
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
+    url = f"{API_BASE}{path}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+    resp_headers = {k: v for k, v in r.headers.items()}
     try:
-        r = requests.request(method, url, headers=headers, json=json_body, timeout=30)
-    except Exception as e:
-        raise RuntimeError(f"HTTP error on {path}: {e}")
-
-    try:
-        data = r.json() if r.text else None
+        data = r.json()
     except Exception:
         data = r.text
+    return r.status_code, data, resp_headers
 
-    return r.status_code, data, dict(r.headers)
+
+def parse_retry_after(headers: Dict[str, str]) -> Optional[int]:
+    ra = headers.get("Retry-After") or headers.get("retry-after")
+    if not ra:
+        return None
+    try:
+        return int(float(ra))
+    except Exception:
+        return None
 
 
 def get_home_ids(access_token: str) -> List[int]:
-    path = "/api/v2/homes"
-    status, data, headers = api_request("GET", path, access_token)
+    status, data, headers = api_request("GET", "/me", access_token)
     if status == 429:
-        raise RateLimitError(path, parse_retry_after(headers))
+        raise RateLimitError("/me", parse_retry_after(headers))
     if status != 200:
-        raise RuntimeError(f"Tado API {status} on {path}: {data}")
-    ids: List[int] = []
-    if isinstance(data, list):
-        for h in data:
-            try:
-                ids.append(int(h.get("id")))
-            except Exception:
-                pass
-    return ids
+        raise RuntimeError(f"/me failed status={status} data={data}")
+
+    home_ids: List[int] = []
+    if isinstance(data, dict):
+        homes = data.get("homes")
+        if isinstance(homes, list):
+            for h in homes:
+                if isinstance(h, dict):
+                    hid = h.get("id") or h.get("homeId")
+                    if isinstance(hid, int):
+                        home_ids.append(hid)
+        if isinstance(data.get("homeId"), int):
+            home_ids.append(data["homeId"])
+
+    home_ids = sorted(list(set(home_ids)))
+    if not home_ids:
+        raise RuntimeError(f"No home ids found in /me response: {data}")
+    return home_ids
 
 
 def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
-    path = f"/api/v2/homes/{home_id}/mobileDevices"
+    path = f"/homes/{home_id}/mobileDevices"
     status, data, headers = api_request("GET", path, access_token)
     if status == 429:
         raise RateLimitError(path, parse_retry_after(headers))
     if status != 200:
-        raise RuntimeError(f"Tado API {status} on {path}: {data}")
+        raise RuntimeError(f"{path} failed status={status} data={data}")
     return data if isinstance(data, list) else []
-
-
-# -----------------------------
-# Open Window (zones)
-# -----------------------------
-def get_zones(access_token: str, home_id: int) -> List[Dict[str, Any]]:
-    path = f"/homes/{home_id}/zones"
-    status, data, headers = api_request("GET", path, access_token)
-    if status == 429:
-        raise RateLimitError(path, parse_retry_after(headers))
-    if status != 200:
-        raise RuntimeError(f"Tado API {status} on {path}: {data}")
-    return data if isinstance(data, list) else []
-
-
-def get_zone_state(access_token: str, home_id: int, zone_id: int) -> Dict[str, Any]:
-    path = f"/homes/{home_id}/zones/{zone_id}/state"
-    status, data, headers = api_request("GET", path, access_token)
-    if status == 429:
-        raise RateLimitError(path, parse_retry_after(headers))
-    if status != 200:
-        raise RuntimeError(f"Tado API {status} on {path}: {data}")
-    return data if isinstance(data, dict) else {}
-
-
-def zone_open_window_detected(zone_state: Dict[str, Any]) -> bool:
-    ow = zone_state.get("openWindowDetected")
-    if isinstance(ow, bool):
-        return ow
-    if isinstance(ow, str):
-        return ow.strip().lower() == "true"
-    if isinstance(ow, dict):
-        v = ow.get("detected")
-        if isinstance(v, bool):
-            return v
-        v = ow.get("value")
-        if isinstance(v, bool):
-            return v
-        v = ow.get("openWindowDetected")
-        if isinstance(v, bool):
-            return v
-    return False
-
-
-def activate_open_window(access_token: str, home_id: int, zone_id: int) -> None:
-    path = f"/homes/{home_id}/zones/{zone_id}/state/openWindow/activate"
-    status, data, headers = api_request("POST", path, access_token)
-    if status == 429:
-        raise RateLimitError(path, parse_retry_after(headers))
-    if status not in (200, 204):
-        raise RuntimeError(f"Tado API {status} on {path}: {data}")
-
-
-def cancel_open_window(access_token: str, home_id: int, zone_id: int) -> None:
-    path = f"/homes/{home_id}/zones/{zone_id}/state/openWindow"
-    status, data, headers = api_request("DELETE", path, access_token)
-    if status == 429:
-        raise RateLimitError(path, parse_retry_after(headers))
-    if status not in (200, 204):
-        raise RuntimeError(f"Tado API {status} on {path}: {data}")
 
 
 # -----------------------------
 # Token handling
 # -----------------------------
+
+
+def get_zones(access_token: str, home_id: int) -> List[Dict[str, Any]]:
+    status, data, headers = api_request("GET", f"/homes/{home_id}/zones", access_token)
+    if status == 429:
+        raise RateLimitError(f"/homes/{home_id}/zones", parse_retry_after(headers))
+    if status != 200:
+        raise RuntimeError(f"/homes/{home_id}/zones failed status={status} data={data}")
+    return data if isinstance(data, list) else []
+
+
+def get_zone_state(access_token: str, home_id: int, zone_id: int) -> Dict[str, Any]:
+    status, data, headers = api_request("GET", f"/homes/{home_id}/zones/{zone_id}/state", access_token)
+    if status == 429:
+        raise RateLimitError(f"/homes/{home_id}/zones/{zone_id}/state", parse_retry_after(headers))
+    if status != 200:
+        raise RuntimeError(f"/homes/{home_id}/zones/{zone_id}/state failed status={status} data={data}")
+    return data if isinstance(data, dict) else {}
+
+
+def zone_open_window_detected(zone_state: Dict[str, Any]) -> bool:
+    v = zone_state.get("openWindowDetected")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() == "true"
+    if isinstance(v, dict):
+        for k in ("detected", "value", "openWindowDetected"):
+            vv = v.get(k)
+            if isinstance(vv, bool):
+                return vv
+            if isinstance(vv, str) and vv.strip().lower() in ("true", "false"):
+                return vv.strip().lower() == "true"
+    return False
+
+
+def activate_open_window(access_token: str, home_id: int, zone_id: int) -> None:
+    status, data, headers = api_request(
+        "POST",
+        f"/homes/{home_id}/zones/{zone_id}/state/openWindow/activate",
+        access_token,
+    )
+    if status == 429:
+        raise RateLimitError(f"/homes/{home_id}/zones/{zone_id}/state/openWindow/activate", parse_retry_after(headers))
+    if status not in (200, 204):
+        raise RuntimeError(f"activate openWindow failed status={status} data={data}")
+
+
+def cancel_open_window(access_token: str, home_id: int, zone_id: int) -> None:
+    status, data, headers = api_request(
+        "DELETE",
+        f"/homes/{home_id}/zones/{zone_id}/state/openWindow",
+        access_token,
+    )
+    if status == 429:
+        raise RateLimitError(f"/homes/{home_id}/zones/{zone_id}/state/openWindow", parse_retry_after(headers))
+    if status not in (200, 204):
+        raise RuntimeError(f"cancel openWindow failed status={status} data={data}")
+def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
+    if "_obtained_at_epoch" in tokens:
+        try:
+            return int(tokens["_obtained_at_epoch"])
+        except Exception:
+            pass
+    s = tokens.get("_obtained_at")
+    if isinstance(s, str) and s:
+        try:
+            return int(datetime.fromisoformat(s).timestamp())
+        except Exception:
+            return None
+    return None
+
+
+def token_expires_at(tokens: Dict[str, Any]) -> Optional[int]:
+    obtained = _obtained_epoch(tokens)
+    try:
+        expires_in = int(tokens.get("expires_in"))
+    except Exception:
+        return None
+    if obtained is None:
+        return None
+    return obtained + expires_in
+
+
+def token_is_expired(tokens: Dict[str, Any], skew_seconds: int = 60) -> bool:
+    exp = token_expires_at(tokens)
+    if exp is None:
+        return True
+    return time.time() >= (exp - skew_seconds)
+
+
+def refresh_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError("refresh_token missing in tokens file (login again via Ingress)")
+
+    payload = {
+        "client_id": TADO_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    r = requests.post(TOKEN_URL, data=payload, timeout=HTTP_TIMEOUT)
+    if r.status_code == 429:
+        ra = parse_retry_after({k: v for k, v in r.headers.items()})
+        raise RateLimitError("oauth2/token", ra)
+
+    try:
+        data = r.json()
+    except Exception:
+        data = r.text
+
+    if r.status_code != 200 or not (isinstance(data, dict) and data.get("access_token")):
+        raise RuntimeError(f"token refresh failed status={r.status_code} data={data}")
+
+    new_tokens = dict(tokens)
+    new_tokens.update(data)
+
+    if not new_tokens.get("refresh_token"):
+        new_tokens["refresh_token"] = refresh_token
+
+    new_tokens["_obtained_at"] = now_iso()
+    new_tokens["_obtained_at_epoch"] = int(time.time())
+
+    write_json_atomic(TOKENS_PATH, new_tokens)
+    log("Token refreshed.")
+    return new_tokens
+
+
 def ensure_valid_tokens() -> Dict[str, Any]:
     tokens = read_json(TOKENS_PATH)
-    if not tokens:
-        raise RuntimeError("tokens file missing or invalid JSON")
+    if not isinstance(tokens, dict):
+        raise RuntimeError(f"tokens file invalid: {TOKENS_PATH}")
 
-    access_token = tokens.get("access_token")
-    if not access_token:
-        raise RuntimeError("access_token missing in tokens file")
-
-    # refresh if expiring soon (best-effort)
-    expires_at = tokens.get("expires_at")
-    if expires_at:
-        try:
-            expires_at = float(expires_at)
-        except Exception:
-            expires_at = None
-
-    if expires_at and (expires_at - time.time()) < 60:
-        refresh_token = tokens.get("refresh_token")
-        client_id = tokens.get("client_id")
-        client_secret = tokens.get("client_secret")
-        if not refresh_token or not client_id or not client_secret:
-            log("ERROR: refresh_token/client_id/client_secret missing in tokens file")
-            return tokens
-
-        log("token needs refresh -> refreshing")
-        newt = refresh_tokens(str(refresh_token), str(client_id), str(client_secret))
-        tokens.update(newt)
-        write_json_atomic(TOKENS_PATH, tokens)
-
+    if token_is_expired(tokens):
+        tokens = refresh_tokens(tokens)
     return tokens
 
 
-def refresh_tokens(refresh_token: str, client_id: str, client_secret: str) -> Dict[str, Any]:
-    url = f"{tado_base_url()}/oauth/token"
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
-    r = requests.post(url, data=data, timeout=30)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"raw": r.text}
+# -----------------------------
+# Auto-Assist runtime state + MQTT entity
+# -----------------------------
+def read_auto_assist_runtime() -> Dict[str, Any]:
+    st = read_json(AUTO_ASSIST_STATE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("enabled", False)
+    st.setdefault("last_run", None)
+    st.setdefault("last_action", None)
+    st.setdefault("last_error", None)
+    return st
 
-    if r.status_code != 200:
-        raise RuntimeError(f"token refresh failed {r.status_code}: {j}")
 
-    out = {
-        "access_token": j.get("access_token"),
-        "refresh_token": j.get("refresh_token", refresh_token),
+def boot_auto_assist_force_off() -> Dict[str, Any]:
+    st = read_auto_assist_runtime()
+    st["enabled"] = False
+    st["last_action"] = "boot_off"
+    st["last_error"] = None
+    st["last_run"] = now_iso()
+    write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+    return st
+
+
+def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+
+    tp = cfg["topic_prefix"]
+    enabled = bool(st.get("enabled"))
+
+    mpub.publish(f"{tp}/{AUTO_ASSIST_STATE_TOPIC}", "ON" if enabled else "OFF", retain=True)
+    mpub.publish_json(
+        f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        {
+            "enabled": enabled,
+            "last_run": st.get("last_run"),
+            "last_action": st.get("last_action"),
+            "last_error": st.get("last_error"),
+            "_ts": now_iso(),
+        },
+        retain=True,
+    )
+
+
+def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+
+    dp = cfg["discovery_prefix"]
+    tp = cfg["topic_prefix"]
+    ha_device_name = cfg["ha_device_name"]
+    ha_device_id = cfg["ha_device_id"]
+
+    device_block = {
+        "identifiers": [ha_device_id],
+        "name": ha_device_name,
+        "manufacturer": "tado°",
+        "model": "Tado Assistant (Ingress)",
     }
-    expires_in = j.get("expires_in")
-    try:
-        expires_in = int(expires_in)
-    except Exception:
-        expires_in = 3600
-    out["expires_at"] = time.time() + expires_in
-    return out
+
+    # Canonical discovery path: node_id + object_id
+    node_id = ha_device_id
+    object_id = "auto_assist"
+    config_topic = f"{dp}/switch/{node_id}/{object_id}/config"
+
+
+    payload = {
+        "name": "Auto-Assist",
+        "unique_id": f"{ha_device_id}_auto_assist",
+        "state_topic": f"{tp}/{AUTO_ASSIST_STATE_TOPIC}",
+        "command_topic": f"{tp}/{AUTO_ASSIST_SET_TOPIC}",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "state_on": "ON",
+        "state_off": "OFF",
+        "optimistic": False,
+        "retain": True,
+
+
+        "json_attributes_topic": f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        "device": device_block,
+        "icon": "mdi:robot",
+    }
+
+    mpub.publish_json(config_topic, payload, retain=True)
+
+
+def cleanup_old_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    if not mpub.client:
+        return
+
+    dp = cfg["discovery_prefix"]
+    ha_device_id = cfg["ha_device_id"]
+
+    old_topics = [
+        # non-canonical variants used previously
+        f"{dp}/switch/{ha_device_id}_auto_assist/config",
+        f"{dp}/switch/{ha_device_id}/{ha_device_id}_auto_assist/config",
+        f"{dp}/switch/{ha_device_id}/{ha_device_id}_auto_assist_switch/config",
+        # some double-prefixed attempts
+        f"{dp}/switch/{ha_device_id}_tado_assistant_auto_assist/config",
+    ]
+    for t in old_topics:
+        mpub.publish_delete_retained(t)
 
 
 # -----------------------------
-# Presence normalization / publish + discovery
+# Presence normalization / publish + discovery (unchanged, already working for you)
 # -----------------------------
 def normalize_presence(device: Dict[str, Any]) -> Dict[str, Any]:
-    name = device.get("name") or f"device_{device.get('id')}"
-    did = device.get("id") or name
-    at_home = False
-    loc = device.get("location")
-    if isinstance(loc, dict):
-        at_home = bool(loc.get("atHome", False))
-    return {
-        "id": did,
-        "name": name,
-        "at_home": at_home,
-        "raw": device,
-    }
+    name = device.get("name") or device.get("deviceName") or device.get("model") or "unknown"
+    dev_id = device.get("id") or device.get("deviceId")
+
+    at_home = None
+    if isinstance(device.get("location"), dict) and "atHome" in device["location"]:
+        at_home = bool(device["location"]["atHome"])
+    elif "atHome" in device:
+        at_home = bool(device.get("atHome"))
+
+    if at_home is True:
+        state = "home"
+    elif at_home is False:
+        state = "not_home"
+    else:
+        state = "unknown"
+
+    return {"id": dev_id, "name": name, "state": state, "at_home": at_home, "_ts": now_iso(), "raw": device}
 
 
-def safe_object_id(s: str) -> str:
-    out = []
-    for ch in s.lower():
-        if ch.isalnum():
-            out.append(ch)
-        elif ch in (" ", "-", "_"):
-            out.append("_")
-    v = "".join(out).strip("_")
-    while "__" in v:
-        v = v.replace("__", "_")
-    return v or "unknown"
+def discovery_object_ids(ha_device_id: str, device_id: int) -> Tuple[str, str, str]:
+    tracker_object_id = f"{ha_device_id}_presence_{device_id}"
+    raw_object_id = f"{ha_device_id}_presence_{device_id}_raw"
+    old_json_object_id = f"{ha_device_id}_presence_{device_id}_json"
+    return tracker_object_id, raw_object_id, old_json_object_id
 
 
 def publish_discovery_for_devices(
@@ -506,122 +685,110 @@ def publish_discovery_for_devices(
         "manufacturer": "tado°",
         "model": "Tado Assistant (Ingress)",
     }
+    availability_topic = f"{topic_prefix}/_status"
+
+    # Home raw (optional)
+    if enable_raw_sensors:
+        agg_object_id_new = f"{ha_device_id}_home_{home_id}_raw"
+        agg_object_id_old = f"{ha_device_id}_home_{home_id}_presence"
+        agg_config_topic_new = f"{discovery_prefix}/sensor/{agg_object_id_new}/config"
+        agg_config_topic_old = f"{discovery_prefix}/sensor/{agg_object_id_old}/config"
+        agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
+
+        mpub.publish_delete_retained(agg_config_topic_old)
+
+        agg_payload = {
+            "name": f"Tado Home {home_id} (raw)",
+            "unique_id": f"{ha_device_id}_home_{home_id}_raw",
+            "state_topic": agg_topic,
+            "value_template": "{{ value_json._ts }}",
+            "json_attributes_topic": agg_topic,
+            "device": device_block,
+            "icon": "mdi:home-account",
+        }
+        mpub.publish_json(agg_config_topic_new, agg_payload, retain=True)
 
     for d in devices:
-        name = str(d.get("name") or d.get("id"))
-        oid = safe_object_id(name)
-        did = str(d.get("id") or oid)
+        did = d.get("id")
+        name = d.get("name") or f"Device {did}"
+        if not did:
+            continue
+        did_int = int(did)
 
-        # device_tracker
-        node_id = ha_device_id
-        object_id = f"presence_{home_id}_{oid}"
-        config_topic = f"{discovery_prefix}/device_tracker/{node_id}/{object_id}/config"
-        state_topic = f"{topic_prefix}/presence/{home_id}/{did}/state"
+        tracker_object_id, raw_object_id, old_json_object_id = discovery_object_ids(ha_device_id, did_int)
 
-        payload = {
+        state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/state"
+        raw_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/raw"
+
+        mpub.publish_delete_retained(f"{discovery_prefix}/binary_sensor/{tracker_object_id}/config")
+
+        tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
+        tracker_payload = {
             "name": f"Tado {name}",
-            "unique_id": f"{ha_device_id}_home_{home_id}_{did}_tracker",
+            "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_tracker",
             "state_topic": state_topic,
             "payload_home": "home",
             "payload_not_home": "not_home",
             "source_type": "gps",
             "device": device_block,
         }
-        mpub.publish_json(config_topic, payload, retain=True)
+        mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
-        # raw sensor
         if enable_raw_sensors:
-            object_id2 = f"presence_{home_id}_{oid}_raw"
-            config_topic2 = f"{discovery_prefix}/sensor/{node_id}/{object_id2}/config"
-            state_topic2 = f"{topic_prefix}/presence/{home_id}/{did}/raw"
+            mpub.publish_delete_retained(f"{discovery_prefix}/sensor/{old_json_object_id}/config")
 
-            payload2 = {
+            raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
+            raw_payload = {
                 "name": f"Tado {name} (raw)",
-                "unique_id": f"{ha_device_id}_home_{home_id}_{did}_raw",
-                "state_topic": state_topic2,
-                "value_template": "{{ value_json.timestamp }}",
-                "json_attributes_topic": state_topic2,
+                "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
+                "state_topic": state_topic,
+                "json_attributes_topic": raw_topic,
                 "device": device_block,
-                "entity_category": "diagnostic",
-                "enabled_by_default": False,
+                "icon": "mdi:account",
             }
-            mpub.publish_json(config_topic2, payload2, retain=True)
-
-    # home raw sensor (to get back old count style)
-    if enable_raw_sensors:
-        node_id = ha_device_id
-        object_id = f"home_{home_id}_raw"
-        config_topic = f"{discovery_prefix}/sensor/{node_id}/{object_id}/config"
-        state_topic = f"{topic_prefix}/presence/{home_id}/home_raw"
-        payload = {
-            "name": f"Tado Home {home_id} (raw)",
-            "unique_id": f"{ha_device_id}_home_{home_id}_raw",
-            "state_topic": state_topic,
-            "value_template": "{{ value_json.timestamp }}",
-            "json_attributes_topic": state_topic,
-            "device": device_block,
-            "entity_category": "diagnostic",
-            "enabled_by_default": False,
-        }
-        mpub.publish_json(config_topic, payload, retain=True)
+            mpub.publish_json(raw_config_topic, raw_payload, retain=True)
 
 
-def publish_presence(
+
+
+OPEN_WINDOW_DISCOVERY_STATE_PATH = os.path.join(CACHE_DIR, "open_window_discovery_state.json")
+
+
+def _load_open_window_discovery_state() -> Dict[str, Any]:
+    st = read_json(OPEN_WINDOW_DISCOVERY_STATE_PATH)
+    if isinstance(st, dict):
+        return st
+    return {"homes": {}}
+
+
+def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
+    write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
+
+
+def publish_open_window_discovery(
     mpub: MqttPub,
-    topic_prefix: str,
-    home_id: int,
-    devices: List[Dict[str, Any]],
-    enable_raw_sensors: bool,
-) -> None:
-    ts = now_iso()
-    home_raw: Dict[str, Any] = {"timestamp": ts, "home_id": home_id, "devices": []}
-
-    for d in devices:
-        did = str(d.get("id"))
-        at_home = bool(d.get("at_home"))
-        state_topic = f"{topic_prefix}/presence/{home_id}/{did}/state"
-        mpub.publish(state_topic, "home" if at_home else "not_home", retain=True)
-
-        if enable_raw_sensors:
-            raw_topic = f"{topic_prefix}/presence/{home_id}/{did}/raw"
-            raw_payload = {"timestamp": ts, **(d.get("raw") or {})}
-            mpub.publish_json(raw_topic, raw_payload, retain=True)
-
-        home_raw["devices"].append({"id": did, "name": d.get("name"), "at_home": at_home})
-
-    if enable_raw_sensors:
-        mpub.publish_json(f"{topic_prefix}/presence/{home_id}/home_raw", home_raw, retain=True)
-
-
-def publish_open_window_discovery_for_home(
-    mpub: MqttPub,
-    discovery_prefix: str,
-    topic_prefix: str,
-    ha_device_name: str,
-    ha_device_id: str,
+    cfg: Dict[str, Any],
     home_id: int,
     zones: List[Dict[str, Any]],
 ) -> List[Tuple[int, str]]:
-    """Publish MQTT Discovery for zone open-window sensors.
-    Returns list of (zone_id, zone_name) that were published.
-    """
-    if not mpub.client:
-        return []
+    discovery_prefix = cfg["discovery_prefix"]
+    topic_prefix = cfg["topic_prefix"]
+    ha_device_name = cfg["ha_device_name"]
+    ha_device_id = cfg["ha_device_id"]
 
     device_block = {
         "identifiers": [ha_device_id],
         "name": ha_device_name,
         "manufacturer": "tado°",
-        "model": "Tado Assistant (Ingress)",
+        "model": "Tado Assistant",
     }
-    availability_topic = f"{topic_prefix}/_status"
 
+    availability_topic = f"{topic_prefix}/_status"
     published: List[Tuple[int, str]] = []
 
     for z in zones:
         if not isinstance(z, dict):
             continue
-
         zid = z.get("id")
         zname = z.get("name") or f"Zone {zid}"
         try:
@@ -629,7 +796,6 @@ def publish_open_window_discovery_for_home(
         except Exception:
             continue
 
-        # Only zones where Open Window detection is supported & enabled
         owd = z.get("openWindowDetection")
         supported = True
         enabled = True
@@ -642,9 +808,8 @@ def publish_open_window_discovery_for_home(
             continue
 
         node_id = ha_device_id
-        object_id = f"open_window_{home_id}_{zid_int}"
+        object_id = f"open_window_home_{home_id}_zone_{zid_int}"
         config_topic = f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config"
-
         state_topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid_int}/state"
 
         payload = {
@@ -663,170 +828,203 @@ def publish_open_window_discovery_for_home(
         mpub.publish_json(config_topic, payload, retain=True)
         published.append((zid_int, str(zname)))
 
+        # Cleanup older object_id variant (from earlier builds)
+        old_object_id = f"open_window_{home_id}_{zid_int}"
+        if old_object_id != object_id:
+            old_config_topic = f"{discovery_prefix}/binary_sensor/{node_id}/{old_object_id}/config"
+            mpub.publish(old_config_topic, "", retain=True)
+
+    st = _load_open_window_discovery_state()
+    homes = st.get("homes", {})
+    if not isinstance(homes, dict):
+        homes = {}
+    prev = homes.get(str(home_id), [])
+    if not isinstance(prev, list):
+        prev = []
+
+    current_zone_ids = [zid for zid, _ in published]
+    for prev_zid in prev:
+        try:
+            prev_zid_int = int(prev_zid)
+        except Exception:
+            continue
+        if prev_zid_int not in current_zone_ids:
+            node_id = ha_device_id
+            object_id = f"open_window_home_{home_id}_zone_{prev_zid_int}"
+            config_topic = f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config"
+            mpub.publish(config_topic, "", retain=True)
+
+    homes[str(home_id)] = current_zone_ids
+    st["homes"] = homes
+    _save_open_window_discovery_state(st)
+
     return published
 
 
 def publish_open_window_states(
     mpub: MqttPub,
+    cfg: Dict[str, Any],
+    home_id: int,
+    zone_states: List[Tuple[int, Dict[str, Any]]],
+) -> None:
+    topic_prefix = cfg["topic_prefix"]
+    for zid, zstate in zone_states:
+        detected = zone_open_window_detected(zstate)
+        topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid}/state"
+        mpub.publish(topic, "ON" if detected else "OFF", retain=True)
+def publish_presence(
+    mpub: MqttPub,
     topic_prefix: str,
     home_id: int,
-    zone_states: List[Tuple[int, str, Dict[str, Any]]],
+    devices: List[Dict[str, Any]],
+    enable_raw_sensors: bool,
 ) -> None:
-    """Publish ON/OFF window state per zone."""
-    for zid, _zname, zstate in zone_states:
-        detected = zone_open_window_detected(zstate)
-        state_topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid}/state"
-        mpub.publish(state_topic, "ON" if detected else "OFF", retain=True)
+    for d in devices:
+        did_int = int(d["id"])
+        state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/state"
+        raw_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/raw"
 
+        mpub.publish(state_topic, str(d.get("state", "unknown")), retain=True)
+        if enable_raw_sensors:
+            mpub.publish_json(raw_topic, d, retain=True)
 
-# -----------------------------
-# Auto-Assist Switch (MQTT Discovery + state + command)
-# -----------------------------
-def read_auto_assist_runtime() -> Dict[str, Any]:
-    st = read_json(AUTO_ASSIST_STATE_PATH)
-    if not st:
-        st = {"enabled": False, "last_run": None, "last_action": None, "last_error": None}
-    if "enabled" not in st:
-        st["enabled"] = False
-    return st
+    if enable_raw_sensors:
+        agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
+        mpub.publish_json(agg_topic, {"_ts": now_iso(), "home_id": home_id, "devices": devices}, retain=True)
 
-
-def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
-    if not mpub.client:
-        return
-
-    discovery_prefix = cfg["discovery_prefix"]
-    topic_prefix = cfg["topic_prefix"]
-    ha_device_name = cfg["ha_device_name"]
-    ha_device_id = cfg["ha_device_id"]
-
-    device_block = {
-        "identifiers": [ha_device_id],
-        "name": ha_device_name,
-        "manufacturer": "tado°",
-        "model": "Tado Assistant (Ingress)",
-    }
-
-    config_topic = f"{discovery_prefix}/switch/{ha_device_id}/auto_assist/config"
-
-    state_topic = f"{topic_prefix}/auto_assist/state"
-    command_topic = f"{topic_prefix}/auto_assist/set"
-    attrs_topic = f"{topic_prefix}/auto_assist/attrs"
-
-    payload = {
-        "name": "Auto-Assist",
-        "unique_id": f"{ha_device_id}_auto_assist_switch",
-        "state_topic": state_topic,
-        "command_topic": command_topic,
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "state_on": "ON",
-        "state_off": "OFF",
-        "icon": "mdi:thermostat-auto",
-        "json_attributes_topic": attrs_topic,
-        "device": device_block,
-    }
-
-    mpub.publish_json(config_topic, payload, retain=True)
-    log(f"auto_assist discovery published: {config_topic}")
-
-
-def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
-    topic_prefix = cfg["topic_prefix"]
-    state_topic = f"{topic_prefix}/auto_assist/state"
-    attrs_topic = f"{topic_prefix}/auto_assist/attrs"
-
-    mpub.publish(state_topic, "ON" if st.get("enabled") else "OFF", retain=True)
-    mpub.publish_json(attrs_topic, st, retain=True)
-
-
-def setup_auto_assist_switch(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
-    topic_prefix = cfg["topic_prefix"]
-    command_topic = f"{topic_prefix}/auto_assist/set"
-
-    def on_cmd(topic: str, payload: str) -> None:
-        val = payload.strip().upper()
-        enabled = (val == "ON" or val == "1" or val == "TRUE")
-        st = read_auto_assist_runtime()
-        st["enabled"] = enabled
-        st["last_run"] = now_iso()
-        st["last_action"] = "enabled" if enabled else "disabled"
-        st["last_error"] = None
-        write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
-        publish_auto_assist(mpub, cfg, st)
-        log(f"auto_assist set to {enabled}")
-
-    mpub.subscribe(command_topic, on_cmd)
-    log(f"auto_assist subscribed: {command_topic}")
-
-
-# -----------------------------
-# Cache helpers
-# -----------------------------
-def save_cached_home_ids(home_ids: List[int]) -> None:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    write_json_atomic(os.path.join(CACHE_DIR, "home_ids.json"), {"home_ids": home_ids})
-
-
-def load_cached_home_ids() -> Optional[List[int]]:
-    p = os.path.join(CACHE_DIR, "home_ids.json")
-    d = read_json(p)
-    if not d:
-        return None
-    v = d.get("home_ids")
-    if isinstance(v, list):
-        out: List[int] = []
-        for x in v:
-            try:
-                out.append(int(x))
-            except Exception:
-                pass
-        return out
-    return None
+    cache = read_json(LAST_DEVICES_PATH)
+    if not isinstance(cache, dict):
+        cache = {}
+    cache[str(home_id)] = {"_ts": now_iso(), "devices": devices}
+    write_json_atomic(LAST_DEVICES_PATH, cache)
 
 
 def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
-    # minimal: republish auto-assist discovery so HA doesn't lose it after downtime
-    try:
-        publish_auto_assist_discovery(mpub, cfg)
-        publish_auto_assist(mpub, cfg, read_auto_assist_runtime())
-    except Exception:
-        pass
+    cache = read_json(LAST_DEVICES_PATH)
+    if not isinstance(cache, dict):
+        return
+    topic_prefix = cfg["topic_prefix"]
+    enable_raw = bool(cfg.get("enable_raw_sensors", True))
+    for home_id_s, payload in cache.items():
+        try:
+            home_id = int(home_id_s)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("devices"), list):
+            devices = payload["devices"]
+            try:
+                publish_presence(mpub, topic_prefix, home_id, devices, enable_raw)
+                log(f"republished cached presence home={home_id} devices={len(devices)}")
+            except Exception:
+                pass
 
 
-DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
+def load_cached_home_ids() -> Optional[List[int]]:
+    st = read_json(DISCOVERY_STATE_PATH)
+    if isinstance(st, dict):
+        hid = st.get("home_ids")
+        if isinstance(hid, list):
+            out: List[int] = []
+            for x in hid:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    pass
+            return sorted(list(set(out))) if out else None
+    return None
 
 
+def save_cached_home_ids(home_ids: List[int]) -> None:
+    st = read_json(DISCOVERY_STATE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    st["home_ids"] = home_ids
+    write_json_atomic(DISCOVERY_STATE_PATH, st)
+
+
+# -----------------------------
+# Main loop
+# -----------------------------
 def main() -> None:
     cfg = load_config()
+
     poll = int(cfg["poll_seconds"])
-    enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
-    enable_open_window = bool(cfg.get("enable_open_window", True))
-    max_open_window_duration = cfg.get("max_open_window_duration")
 
-    mpub = MqttPub(cfg)
-    mpub.connect()
-
-    discovery_prefix = cfg["discovery_prefix"]
+    # Open-Window runtime caches
+    zones_cache: Dict[int, List[Dict[str, Any]]] = {}
+    zones_last_refresh: Dict[int, float] = {}
+    open_window_last_poll: Dict[int, float] = {}
+    open_window_activations: Dict[Tuple[int, int], int] = {}
     topic_prefix = cfg["topic_prefix"]
+    discovery_prefix = cfg["discovery_prefix"]
     ha_device_name = cfg["ha_device_name"]
     ha_device_id = cfg["ha_device_id"]
+    enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
 
-    # publish discovery for auto-assist switch
-    publish_auto_assist_discovery(mpub, cfg)
-    setup_auto_assist_switch(mpub, cfg)
-    publish_auto_assist(mpub, cfg, read_auto_assist_runtime())
+    log(f"starting. poll_seconds={poll} enable_raw_sensors={enable_raw_sensors}")
 
-    home_ids = cfg.get("tado_home_ids") or load_cached_home_ids()
+    # Force OFF after every restart (your requirement)
+    boot_auto_assist_force_off()
+
+    mpub = MqttPub(cfg["mqtt"])
+
+    def handle_mqtt_message(topic: str, payload: str) -> None:
+        wanted = f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}"
+        if topic != wanted:
+            return
+
+        cmd = (payload or "").strip().upper()
+        st = read_auto_assist_runtime()
+
+        if cmd not in ("ON", "OFF"):
+            st["last_error"] = f"invalid command payload: '{payload}'"
+            st["last_action"] = "reject_command"
+            st["last_run"] = now_iso()
+            write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+            publish_auto_assist(mpub, cfg, st)
+            return
+
+        st["enabled"] = (cmd == "ON")
+        st["last_action"] = "switch_on" if st["enabled"] else "switch_off"
+        st["last_error"] = None
+        st["last_run"] = now_iso()
+        write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+        publish_auto_assist(mpub, cfg, st)
+        log(f"Auto-Assist switched {cmd}")
+
+    mpub.set_on_message(handle_mqtt_message)
+
+    def handle_connect() -> None:
+        # Availability first
+        mpub.publish(f"{topic_prefix}/_status", "online", retain=True)
+
+        # Remove old retained switch configs so HA stops using them
+        cleanup_old_auto_assist_discovery(mpub, cfg)
+
+        # Publish new switch discovery + initial state/attrs
+        publish_auto_assist_discovery(mpub, cfg)
+        publish_auto_assist(mpub, cfg, read_auto_assist_runtime())
+
+        # Subscribe to HA commands
+        mpub.subscribe(f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}")
+
+        log("auto-assist: discovery+state published; command subscribed")
+
+    mpub.set_on_connect(handle_connect)
+
+    # LWT marks offline if addon dies
+    mpub.start(lwt_topic=f"{topic_prefix}/_status")
+
+    republish_from_cache(mpub, cfg)
+
+    explicit_home_ids: Optional[List[int]] = cfg.get("tado_home_ids")
+    home_ids: Optional[List[int]] = explicit_home_ids or load_cached_home_ids()
 
     backoff_base = int(cfg["rate_limit_backoff_seconds"])
     backoff_max = int(cfg["rate_limit_backoff_max_seconds"])
     backoff_current = backoff_base
 
     loop = 0
-
-    # Track open-window activations (home_id, zone_id) -> epoch seconds
-    open_window_activations: Dict[Tuple[int, int], int] = {}
 
     while True:
         loop += 1
@@ -863,99 +1061,97 @@ def main() -> None:
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
 
-                # Open Window sensors + (optional) Auto-Assist actions
-                if enable_open_window:
-                    zones = get_zones(access_token, home_id)
-                    zones_to_check: List[Tuple[int, str]] = []
-                    for z in zones:
-                        if not isinstance(z, dict):
-                            continue
-                        zid = z.get("id")
-                        zname = z.get("name") or f"Zone {zid}"
-                        try:
-                            zid_int = int(zid)
-                        except Exception:
-                            continue
-                        owd = z.get("openWindowDetection")
-                        supported = True
-                        enabled = True
-                        if isinstance(owd, dict):
-                            if "supported" in owd:
-                                supported = bool(owd.get("supported"))
-                            if "enabled" in owd:
-                                enabled = bool(owd.get("enabled"))
-                        if not supported or not enabled:
-                            continue
-                        zones_to_check.append((zid_int, str(zname)))
 
-                    if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
-                        publish_open_window_discovery_for_home(
-                            mpub,
-                            discovery_prefix,
-                            topic_prefix,
-                            ha_device_name,
-                            ha_device_id,
-                            home_id,
-                            zones,
-                        )
+                # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
+                if cfg.get("enable_open_window"):
+                    now_t = time.time()
+                    if now_t - open_window_last_poll.get(home_id, 0) >= float(cfg.get("open_window_poll_seconds", poll)):
+                        open_window_last_poll[home_id] = now_t
 
-                    zone_states: List[Tuple[int, str, Dict[str, Any]]] = []
-                    for zid_int, zname in zones_to_check:
-                        zstate = get_zone_state(access_token, home_id, zid_int)
-                        zone_states.append((zid_int, zname, zstate))
+                        # refresh zones list occasionally
+                        if now_t - zones_last_refresh.get(home_id, 0) >= float(cfg.get("zones_refresh_seconds", 3600)):
+                            zones_cache[home_id] = get_zones(access_token, home_id)
+                            zones_last_refresh[home_id] = now_t
 
-                    publish_open_window_states(mpub, topic_prefix, home_id, zone_states)
+                        zones = zones_cache.get(home_id, [])
+                        if isinstance(zones, list) and zones:
+                            if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
+                                publish_open_window_discovery(mpub, cfg, home_id, zones)
 
-                    # Auto-Assist window actions (activate/cancel) when enabled
-                    st_local = read_auto_assist_runtime()
-                    if st_local.get("enabled") is True:
-                        changed = False
-                        now_epoch = int(time.time())
+                            check_zone_ids: List[int] = []
+                            for z in zones:
+                                if not isinstance(z, dict):
+                                    continue
+                                zid = z.get("id")
+                                try:
+                                    zid_int = int(zid)
+                                except Exception:
+                                    continue
+                                owd = z.get("openWindowDetection")
+                                supported = True
+                                enabled = True
+                                if isinstance(owd, dict):
+                                    if "supported" in owd:
+                                        supported = bool(owd.get("supported"))
+                                    if "enabled" in owd:
+                                        enabled = bool(owd.get("enabled"))
+                                if supported and enabled:
+                                    check_zone_ids.append(zid_int)
 
-                        for zid_int, zname, zstate in zone_states:
-                            detected = zone_open_window_detected(zstate)
-                            key = (home_id, zid_int)
+                            zone_states: List[Tuple[int, Dict[str, Any]]] = []
+                            for zid in check_zone_ids:
+                                zstate = get_zone_state(access_token, home_id, zid)
+                                zone_states.append((zid, zstate))
 
-                            try:
-                                if detected:
-                                    # Cancel after max duration (if configured)
-                                    if isinstance(max_open_window_duration, int) and key in open_window_activations:
-                                        if (now_epoch - open_window_activations[key]) > max_open_window_duration:
-                                            cancel_open_window(access_token, home_id, zid_int)
-                                            open_window_activations.pop(key, None)
-                                            st_local["last_action"] = f"open_window_cancel:{zname}"
-                                            st_local["last_run"] = now_iso()
-                                            st_local["last_error"] = None
-                                            changed = True
-                                            continue
+                            publish_open_window_states(mpub, cfg, home_id, zone_states)
 
-                                    # Activate (once) when detected
-                                    if key not in open_window_activations:
-                                        activate_open_window(access_token, home_id, zid_int)
-                                        open_window_activations[key] = now_epoch
-                                        st_local["last_action"] = f"open_window_activate:{zname}"
+                            # Auto-Assist actions
+                            st_local = read_auto_assist_runtime()
+                            if st_local.get("enabled") is True:
+                                changed = False
+                                now_epoch = int(time.time())
+                                max_dur = cfg.get("max_open_window_duration")
+
+                                for zid, zstate in zone_states:
+                                    detected = zone_open_window_detected(zstate)
+                                    key = (home_id, zid)
+                                    try:
+                                        if detected:
+                                            if key not in open_window_activations:
+                                                activate_open_window(access_token, home_id, zid)
+                                                open_window_activations[key] = now_epoch
+                                                st_local["last_action"] = f"open_window_activate:home{home_id}_zone{zid}"
+                                                st_local["last_run"] = now_iso()
+                                                st_local["last_error"] = None
+                                                changed = True
+                                            else:
+                                                if isinstance(max_dur, int) and max_dur > 0:
+                                                    if now_epoch - open_window_activations.get(key, now_epoch) > max_dur:
+                                                        cancel_open_window(access_token, home_id, zid)
+                                                        open_window_activations.pop(key, None)
+                                                        st_local["last_action"] = f"open_window_cancel:home{home_id}_zone{zid}"
+                                                        st_local["last_run"] = now_iso()
+                                                        st_local["last_error"] = None
+                                                        changed = True
+                                        else:
+                                            if key in open_window_activations:
+                                                open_window_activations.pop(key, None)
+                                    except Exception as e:
                                         st_local["last_run"] = now_iso()
-                                        st_local["last_error"] = None
+                                        st_local["last_action"] = f"open_window_error:home{home_id}_zone{zid}"
+                                        st_local["last_error"] = str(e)
                                         changed = True
-                                else:
-                                    # Reset activation marker when window is closed
-                                    if key in open_window_activations:
-                                        open_window_activations.pop(key, None)
-                            except Exception as e:
-                                st_local["last_run"] = now_iso()
-                                st_local["last_action"] = f"open_window_error:{zname}"
-                                st_local["last_error"] = str(e)
-                                changed = True
 
-                        if changed:
-                            write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
-                            publish_auto_assist(mpub, cfg, st_local)
+                                if changed:
+                                    write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
+                                    publish_auto_assist(mpub, cfg, st_local)
 
             # Auto-Assist heartbeat metadata when enabled (real actions come next)
             st = read_auto_assist_runtime()
             if st.get("enabled") is True:
-                # heartbeat: update last_run, but keep last_action/last_error as the last meaningful values
                 st["last_run"] = now_iso()
+                st["last_action"] = "tick"
+                st["last_error"] = None
                 write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
                 publish_auto_assist(mpub, cfg, st)
 
@@ -992,4 +1188,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
+        log("stopped by user")
         sys.exit(0)
+    except Exception as e:
+        log(f"FATAL: {e}")
+        sys.exit(1)
