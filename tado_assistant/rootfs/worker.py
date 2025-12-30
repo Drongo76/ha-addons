@@ -715,13 +715,22 @@ def publish_discovery_for_devices(
 ) -> None:
     if not mpub.client:
         return
-
-    device_block = {
+    main_device_block = {
         "identifiers": [ha_device_id],
         "name": ha_device_name,
         "manufacturer": "tado°",
         "model": "Tado Assistant (Ingress)",
     }
+
+    def _person_device_block(did_int: int, name: str) -> Dict[str, Any]:
+        # Separate HA device per mobile device so the main device page stays tidy
+        return {
+            "identifiers": [f"{ha_device_id}_mobile_{did_int}"],
+            "name": f"Tado {name}",
+            "manufacturer": "tado°",
+            "model": "Mobile Device",
+            "via_device": ha_device_id,
+        }
     availability_topic = f"{topic_prefix}/_status"
 
     # Home raw (optional)
@@ -738,10 +747,11 @@ def publish_discovery_for_devices(
             "name": f"Tado Home {home_id} (raw)",
             "unique_id": f"{ha_device_id}_home_{home_id}_raw",
             "state_topic": agg_topic,
-            "value_template": "{{ value_json._ts }}",
+            "value_template": "{{ value_json.state | default(value_json._ts) }}",
             "json_attributes_topic": agg_topic,
             "entity_category": "diagnostic",
-            "device": device_block,
+            "enabled_by_default": False,
+            "device": main_device_block,
             "icon": "mdi:home-account",
         }
         mpub.publish_json(agg_config_topic_new, agg_payload, retain=True)
@@ -752,6 +762,7 @@ def publish_discovery_for_devices(
         if not did:
             continue
         did_int = int(did)
+        person_device_block = _person_device_block(did_int, str(name))
 
         tracker_object_id, raw_object_id, old_json_object_id = discovery_object_ids(ha_device_id, did_int)
 
@@ -768,7 +779,7 @@ def publish_discovery_for_devices(
             "payload_home": "home",
             "payload_not_home": "not_home",
             "source_type": "gps",
-            "device": device_block,
+            "device": person_device_block,
         }
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
@@ -780,10 +791,11 @@ def publish_discovery_for_devices(
                 "name": f"Tado {name} (raw)",
                 "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
                 "state_topic": raw_topic,
-                "value_template": "{{ value_json._ts }}",
+                "value_template": "{{ value_json.state | default(value_json._ts) }}",
                 "json_attributes_topic": raw_topic,
                 "entity_category": "diagnostic",
-                "device": device_block,
+                "enabled_by_default": False,
+            "device": person_device_block,
                 "icon": "mdi:code-json",
             }
             mpub.publish_json(raw_config_topic, raw_payload, retain=True)
@@ -792,6 +804,17 @@ def publish_discovery_for_devices(
 
 
 OPEN_WINDOW_DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "open_window_discovery_state.json")
+
+
+def _load_open_window_discovery_state() -> Dict[str, Any]:
+    st = read_json(OPEN_WINDOW_DISCOVERY_STATE_PATH)
+    if isinstance(st, dict):
+        return st
+    return {"homes": {}}
+
+
+def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
+    write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
 
 
 def _load_open_window_discovery_state() -> Dict[str, Any]:
