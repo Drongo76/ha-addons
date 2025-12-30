@@ -721,7 +721,7 @@ def publish_discovery_for_devices(
         "manufacturer": "tado°",
         "model": "Tado Assistant (Ingress)",
     }
-for d in devices:
+    for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
         if not did:
