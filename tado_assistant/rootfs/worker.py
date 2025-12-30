@@ -728,6 +728,14 @@ def publish_discovery_for_devices(
             continue
         did_int = int(did)
 
+        mobile_device_block = {
+            "identifiers": [f"{ha_device_id}_home_{home_id}_mobile_{did_int}"],
+            "name": f"{name}",
+            "manufacturer": "tado°",
+            "model": "Mobile Device",
+            "via_device": ha_device_id,
+        }
+
         tracker_object_id, raw_object_id, old_json_object_id = discovery_object_ids(ha_device_id, did_int)
 
         state_topic = f"{topic_prefix}/presence/home_{home_id}/device_{did_int}/state"
@@ -743,7 +751,7 @@ def publish_discovery_for_devices(
             "payload_home": "home",
             "payload_not_home": "not_home",
             "source_type": "gps",
-            "device": main_device_block,
+            "device": mobile_device_block,
         }
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
@@ -760,7 +768,7 @@ def publish_discovery_for_devices(
 "entity_category": "diagnostic",
 "enabled_by_default": False,
 "icon": "mdi:clipboard-text-outline",
-"device": main_device_block,
+"device": mobile_device_block,
             }
             mpub.publish_json(raw_config_topic, raw_payload, retain=True)
 
