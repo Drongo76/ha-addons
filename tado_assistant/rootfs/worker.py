@@ -737,7 +737,7 @@ def publish_discovery_for_devices(
 
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
-            "name": f"Tado {name}",
+            "name": f"{name}",
             "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_tracker",
             "state_topic": state_topic,
             "payload_home": "home",
@@ -752,15 +752,15 @@ def publish_discovery_for_devices(
 
             raw_config_topic = f"{discovery_prefix}/sensor/{raw_object_id}/config"
             raw_payload = {
-                "name": f"Tado {name} (raw)",
-                "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
-                "state_topic": raw_topic,
-                "value_template": "{{ value_json.state | default('unknown') }}",
-                "json_attributes_topic": raw_topic,
-                "entity_category": "diagnostic",
-                "enabled_by_default": False,
-            "device": main_device_block,
-                "icon": "mdi:code-json",
+"name": f"{name} (raw)",
+"unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
+"state_topic": raw_topic,
+"value_template": "{{ value_json.state | default('unknown') }}",
+"json_attributes_topic": raw_topic,
+"entity_category": "diagnostic",
+"enabled_by_default": False,
+"icon": "mdi:clipboard-text-outline",
+"device": main_device_block,
             }
             mpub.publish_json(raw_config_topic, raw_payload, retain=True)
 
@@ -842,7 +842,7 @@ def publish_open_window_discovery(
         state_topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid_int}/state"
 
         payload = {
-            "name": f"{zname} – Open Window",
+            "name": f"Fenster – {zname}",
             "unique_id": f"{ha_device_id}_home_{home_id}_zone_{zid_int}_open_window",
             "state_topic": state_topic,
             "payload_on": "ON",
