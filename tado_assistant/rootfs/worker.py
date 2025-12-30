@@ -737,7 +737,7 @@ def publish_discovery_for_devices(
 
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
-            "name": f"Verbundene Geräte – {name}",
+            "name": f"{name}",
             "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_tracker",
             "state_topic": state_topic,
             "payload_home": "home",
