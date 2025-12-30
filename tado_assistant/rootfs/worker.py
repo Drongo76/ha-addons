@@ -648,7 +648,7 @@ def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
 
         "json_attributes_topic": f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
         "device": device_block,
-        "icon": "mdi:robot",
+        "icon": "mdi:thermostat-auto",
     }
 
     mpub.publish_json(config_topic, payload, retain=True)
@@ -721,48 +721,12 @@ def publish_discovery_for_devices(
         "manufacturer": "tado°",
         "model": "Tado Assistant (Ingress)",
     }
-
-    def _person_device_block(did_int: int, name: str) -> Dict[str, Any]:
-        # Separate HA device per mobile device so the main device page stays tidy
-        return {
-            "identifiers": [f"{ha_device_id}_mobile_{did_int}"],
-            "name": f"Tado {name}",
-            "manufacturer": "tado°",
-            "model": "Mobile Device",
-            "via_device": ha_device_id,
-        }
-    availability_topic = f"{topic_prefix}/_status"
-
-    # Home raw (optional)
-    if enable_raw_sensors:
-        agg_object_id_new = f"{ha_device_id}_home_{home_id}_raw"
-        agg_object_id_old = f"{ha_device_id}_home_{home_id}_presence"
-        agg_config_topic_new = f"{discovery_prefix}/sensor/{agg_object_id_new}/config"
-        agg_config_topic_old = f"{discovery_prefix}/sensor/{agg_object_id_old}/config"
-        agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
-
-        mpub.publish_delete_retained(agg_config_topic_old)
-
-        agg_payload = {
-            "name": f"Tado Home {home_id} (raw)",
-            "unique_id": f"{ha_device_id}_home_{home_id}_raw",
-            "state_topic": agg_topic,
-            "value_template": "{{ value_json.state | default(value_json._ts) }}",
-            "json_attributes_topic": agg_topic,
-            "entity_category": "diagnostic",
-            "enabled_by_default": False,
-            "device": main_device_block,
-            "icon": "mdi:home-account",
-        }
-        mpub.publish_json(agg_config_topic_new, agg_payload, retain=True)
-
-    for d in devices:
+for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
         if not did:
             continue
         did_int = int(did)
-        person_device_block = _person_device_block(did_int, str(name))
 
         tracker_object_id, raw_object_id, old_json_object_id = discovery_object_ids(ha_device_id, did_int)
 
@@ -779,7 +743,7 @@ def publish_discovery_for_devices(
             "payload_home": "home",
             "payload_not_home": "not_home",
             "source_type": "gps",
-            "device": person_device_block,
+            "device": main_device_block,
         }
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
@@ -791,11 +755,11 @@ def publish_discovery_for_devices(
                 "name": f"Tado {name} (raw)",
                 "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_raw",
                 "state_topic": raw_topic,
-                "value_template": "{{ value_json.state | default(value_json._ts) }}",
+                "value_template": "{{ value_json.state | default('unknown') }}",
                 "json_attributes_topic": raw_topic,
                 "entity_category": "diagnostic",
                 "enabled_by_default": False,
-            "device": person_device_block,
+            "device": main_device_block,
                 "icon": "mdi:code-json",
             }
             mpub.publish_json(raw_config_topic, raw_payload, retain=True)
@@ -859,14 +823,18 @@ def publish_open_window_discovery(
         except Exception:
             continue
 
+        # Open Window sensors only for zones where tado reports the feature as supported AND enabled.
+        # (Hot water zones usually don't support it.)
+        if str(z.get("type") or "").upper() == "HOT_WATER":
+            continue
+
         owd = z.get("openWindowDetection")
-        supported = True
-        enabled = True
-        if isinstance(owd, dict):
-            if "supported" in owd:
-                supported = bool(owd.get("supported"))
-            if "enabled" in owd:
-                enabled = bool(owd.get("enabled"))
+        if not isinstance(owd, dict):
+            continue
+        supported = bool(owd.get("supported", False))
+        enabled = bool(owd.get("enabled", False))
+        if not supported or not enabled:
+            continue
 
         node_id = ha_device_id
         object_id = f"open_window_home_{home_id}_zone_{zid_int}"
@@ -951,7 +919,15 @@ def publish_presence(
 
     if enable_raw_sensors:
         agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
-        mpub.publish_json(agg_topic, {"_ts": now_iso(), "home_id": home_id, "devices": devices}, retain=True)
+                # Overall home presence state: home if any device is home, not_home if all are not_home, else unknown
+        states = [str(d.get("state", "unknown")) for d in devices if isinstance(d, dict)]
+        if any(s == "home" for s in states):
+            home_state = "home"
+        elif states and all(s == "not_home" for s in states):
+            home_state = "not_home"
+        else:
+            home_state = "unknown"
+        mpub.publish_json(agg_topic, {"_ts": now_iso(), "home_id": home_id, "state": home_state, "devices": devices}, retain=True)
 
     cache = read_json(LAST_DEVICES_PATH)
     if not isinstance(cache, dict):
