@@ -648,7 +648,7 @@ def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
 
         "json_attributes_topic": f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
         "device": device_block,
-        "icon": "mdi:robot",
+        "icon": "mdi:thermostat-auto",
     }
 
     mpub.publish_json(config_topic, payload, retain=True)
@@ -721,15 +721,6 @@ def publish_discovery_for_devices(
         "manufacturer": "tado°",
         "model": "Tado Assistant (Ingress)",
     }
-
-    presence_device_block = {
-        "identifiers": [f"{ha_device_id}_presence"],
-        "name": f"{ha_device_name} – Präsenz",
-        "manufacturer": "tado°",
-        "model": "Presence",
-        "via_device": ha_device_id,
-    }
-
     for d in devices:
         did = d.get("id")
         name = d.get("name") or f"Device {did}"
@@ -746,13 +737,13 @@ def publish_discovery_for_devices(
 
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
-            "name": f"{name}",
+            "name": f"Verbundene Geräte – {name}",
             "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_tracker",
             "state_topic": state_topic,
             "payload_home": "home",
             "payload_not_home": "not_home",
             "source_type": "gps",
-            "device": presence_device_block,
+            "device": main_device_block,
         }
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
@@ -769,7 +760,7 @@ def publish_discovery_for_devices(
 "entity_category": "diagnostic",
 "enabled_by_default": False,
 "icon": "mdi:clipboard-text-outline",
-"device": presence_device_block,
+"device": main_device_block,
             }
             mpub.publish_json(raw_config_topic, raw_payload, retain=True)
 
@@ -801,45 +792,6 @@ def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
     write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
 
 
-
-def publish_discovery_for_home_raw(
-    mpub: MqttPub,
-    discovery_prefix: str,
-    topic_prefix: str,
-    ha_device_name: str,
-    ha_device_id: str,
-    home_id: int,
-) -> None:
-    """MQTT discovery for ONE diagnostic sensor that exposes aggregated home presence (raw JSON + state)."""
-    presence_device_block = {
-        "identifiers": [f"{ha_device_id}_presence"],
-        "name": f"{ha_device_name} – Präsenz",
-        "manufacturer": "tado°",
-        "model": "Presence",
-        "via_device": ha_device_id,
-    }
-
-    object_id = f"{ha_device_id}_home_{home_id}_raw"
-    config_topic = f"{discovery_prefix}/sensor/{object_id}/config"
-    availability_topic = f"{topic_prefix}/_status"
-
-    payload = {
-        "name": f"Tado Home {home_id} (raw)",
-        "unique_id": object_id,
-        "state_topic": f"{topic_prefix}/presence/home_{home_id}/raw",
-        "value_template": "{{ value_json.state }}",
-        "json_attributes_topic": f"{topic_prefix}/presence/home_{home_id}/raw",
-        "icon": "mdi:home",
-        "entity_category": "diagnostic",
-        "availability_topic": availability_topic,
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "device": presence_device_block,
-    }
-
-    mpub(config_topic, json.dumps(payload), retain=True)
-
-
 def publish_open_window_discovery(
     mpub: MqttPub,
     cfg: Dict[str, Any],
@@ -852,11 +804,10 @@ def publish_open_window_discovery(
     ha_device_id = cfg["ha_device_id"]
 
     device_block = {
-        "identifiers": [f"{ha_device_id}_windows"],
-        "name": f"{ha_device_name} – Fenster",
+        "identifiers": [ha_device_id],
+        "name": ha_device_name,
         "manufacturer": "tado°",
-        "model": "Open Window",
-        "via_device": ha_device_id,
+        "model": "Tado Assistant",
     }
 
     availability_topic = f"{topic_prefix}/_status"
@@ -891,7 +842,7 @@ def publish_open_window_discovery(
         state_topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid_int}/state"
 
         payload = {
-            "name": zname,
+            "name": f"Fenster – {zname}",
             "unique_id": f"{ha_device_id}_home_{home_id}_zone_{zid_int}_open_window",
             "state_topic": state_topic,
             "payload_on": "ON",
@@ -1143,8 +1094,6 @@ def main() -> None:
                         devices,
                         enable_raw_sensors,
                     )
-                    if enable_raw_sensors:
-                        publish_discovery_for_home_raw(mpub, discovery_prefix, topic_prefix, ha_device_name, ha_device_id, home_id)
 
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
