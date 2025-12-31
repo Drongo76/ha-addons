@@ -46,6 +46,7 @@ DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS = 1800
 AUTO_ASSIST_STATE_TOPIC = "auto_assist/state"   # payload: ON/OFF
 AUTO_ASSIST_SET_TOPIC = "auto_assist/set"       # payload: ON/OFF
 AUTO_ASSIST_ATTRS_TOPIC = "auto_assist/attrs"   # JSON: last_run/last_action/last_error
+AUTO_ASSIST_STATUS_TOPIC = "auto_assist/status"  # text: OFF / ON · HOME / ON · AWAY / ON · UNKNOWN
 
 
 # -----------------------------
@@ -347,16 +348,13 @@ def _is_token_expired_payload(data: Any) -> bool:
     return False
 
 
-def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None, json_body: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None, json_body: Any = None) -> Tuple[int, Any, Dict[str, str]]:
     """Call Tado API and (once) auto-refresh token if we get 401 'access token is expired'."""
     url = f"{API_BASE}{path}"
 
     def _do_request(tok: str) -> Tuple[int, Any, Dict[str, str]]:
         headers = {"Authorization": f"Bearer {tok}"}
-        kwargs = dict(method=method, url=url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-        if json_body is not None:
-            kwargs["json"] = json_body
-        r = requests.request(**kwargs)
+        r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=HTTP_TIMEOUT)
         resp_headers = {k: v for k, v in r.headers.items()}
         try:
             data = r.json()
@@ -427,6 +425,52 @@ def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+def get_home_presence(access_token: str, home_id: int) -> str:
+    """Return current home presence as reported by Tado (/homes/<id>/state). Typically 'HOME' or 'AWAY'."""
+    path = f"/homes/{home_id}/state"
+    status, data, headers = api_request("GET", path, access_token)
+    if status == 429:
+        raise RateLimitError(path, parse_retry_after(headers))
+    if status != 200:
+        raise RuntimeError(f"{path} failed status={status} data={data}")
+    if isinstance(data, dict):
+        pres = data.get("presence")
+        if isinstance(pres, str):
+            return pres.strip().upper()
+    return "UNKNOWN"
+
+
+def set_presence_lock(access_token: str, home_id: int, presence: str) -> None:
+    """Force HOME/AWAY via presenceLock."""
+    presence = presence.strip().upper()
+    if presence not in ("HOME", "AWAY"):
+        raise ValueError(f"invalid presence {presence}")
+    path = f"/homes/{home_id}/presenceLock"
+    status, data, headers = api_request("PUT", path, access_token, json_body={"homePresence": presence})
+    if status == 429:
+        raise RateLimitError(path, parse_retry_after(headers))
+    if status not in (200, 204):
+        raise RuntimeError(f"{path} failed status={status} data={data}")
+
+
+def compute_desired_home_presence(devices: List[Dict[str, Any]]) -> Optional[str]:
+    """Compute desired HOME/AWAY from mobileDevices. Return 'HOME', 'AWAY', or None (unknown)."""
+    tracked_states: List[str] = []
+    for d in devices:
+        raw = d.get("raw") or {}
+        if isinstance(raw, dict):
+            if raw.get("geoTrackingEnabled") is False:
+                continue
+        st = str(d.get("state") or "unknown")
+        if st in ("home", "not_home"):
+            tracked_states.append(st)
+    if any(st == "home" for st in tracked_states):
+        return "HOME"
+    if tracked_states and all(st == "not_home" for st in tracked_states):
+        return "AWAY"
+    return None
+
+
 # -----------------------------
 # Token handling
 # -----------------------------
@@ -488,26 +532,6 @@ def cancel_open_window(access_token: str, home_id: int, zone_id: int) -> None:
         raise RateLimitError(f"/homes/{home_id}/zones/{zone_id}/state/openWindow", parse_retry_after(headers))
     if status not in (200, 204):
         raise RuntimeError(f"cancel openWindow failed status={status} data={data}")
-
-def get_home_state(access_token: str, home_id: int) -> Dict[str, Any]:
-    """GET /api/v2/homes/{home_id}/state"""
-    status, data, headers = api_request("GET", f"/homes/{home_id}/state", access_token)
-    if status != 200:
-        raise RuntimeError(f"GET /homes/{home_id}/state failed: {status} {data}")
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected home state payload: {data!r}")
-    return data
-
-
-def set_presence_lock(access_token: str, home_id: int, presence: str) -> None:
-    """PUT /api/v2/homes/{home_id}/presenceLock with {"homePresence":"HOME|AWAY"}"""
-    presence = presence.upper().strip()
-    if presence not in ("HOME", "AWAY"):
-        raise ValueError(f"invalid presence {presence!r}")
-    status, data, headers = api_request("PUT", f"/homes/{home_id}/presenceLock", access_token, json_body={"homePresence": presence})
-    if status not in (200, 204):
-        raise RuntimeError(f"PUT /homes/{home_id}/presenceLock failed: {status} {data}")
-
 def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
     if "_obtained_at_epoch" in tokens:
         try:
@@ -613,6 +637,7 @@ def boot_auto_assist_force_off() -> Dict[str, Any]:
     return st
 
 
+
 def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
     if not mpub.client:
         return
@@ -620,19 +645,29 @@ def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) 
     tp = cfg["topic_prefix"]
     enabled = bool(st.get("enabled"))
 
+    presence_current = (st.get("presence_current") or "UNKNOWN")
+    presence_desired = (st.get("presence_desired") or "UNKNOWN")
+
+    if not enabled:
+        status_txt = "OFF"
+    else:
+        pres = presence_current if presence_current in ("HOME", "AWAY") else (presence_desired if presence_desired in ("HOME", "AWAY") else "UNKNOWN")
+        status_txt = f"ON · {pres}"
+
     mpub.publish(f"{tp}/{AUTO_ASSIST_STATE_TOPIC}", "ON" if enabled else "OFF", retain=True)
+    mpub.publish(f"{tp}/{AUTO_ASSIST_STATUS_TOPIC}", status_txt, retain=True)
     mpub.publish_json(
         f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
         {
             "enabled": enabled,
+            "presence_current": presence_current,
+            "presence_desired": presence_desired,
             "last_run": st.get("last_run"),
-            "last_action": st.get("last_action"),
-            "last_error": st.get("last_error"),
-            "_ts": now_iso(),
+            "last_action": st.get("last_action") or "",
+            "last_error": st.get("last_error") or "",
         },
         retain=True,
     )
-
 
 def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
     if not mpub.client:
@@ -674,6 +709,40 @@ def publish_auto_assist_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
         "icon": "mdi:thermostat-auto",
     }
 
+    mpub.publish_json(config_topic, payload, retain=True)
+
+
+
+def publish_auto_assist_status_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    """Publish a diagnostic sensor that shows OFF / ON · HOME / ON · AWAY."""
+    if not mpub.client:
+        return
+
+    dp = cfg["discovery_prefix"]
+    tp = cfg["topic_prefix"]
+    ha_device_id = cfg["ha_device_id"]
+
+    main_device_block = {
+        "identifiers": [ha_device_id],
+        "name": cfg["ha_device_name"],
+        "manufacturer": "tado°",
+        "model": "Tado Assistant (Ingress)",
+    }
+
+    config_topic = f"{dp}/sensor/{ha_device_id}/auto_assist_status/config"
+    payload = {
+        "name": "🤖 Auto-Assist Status",
+        "unique_id": f"{ha_device_id}_auto_assist_status",
+        "state_topic": f"{tp}/{AUTO_ASSIST_STATUS_TOPIC}",
+        "json_attributes_topic": f"{tp}/{AUTO_ASSIST_ATTRS_TOPIC}",
+        "availability_topic": f"{tp}/_status",
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "icon": "mdi:thermostat-auto",
+        "entity_category": "diagnostic",
+        "enabled_by_default": True,
+        "device": main_device_block,
+    }
     mpub.publish_json(config_topic, payload, retain=True)
 
 
@@ -1063,6 +1132,7 @@ def main() -> None:
 
         # Publish new switch discovery + initial state/attrs
         publish_auto_assist_discovery(mpub, cfg)
+        publish_auto_assist_status_discovery(mpub, cfg)
         publish_auto_assist(mpub, cfg, read_auto_assist_runtime())
 
         # Subscribe to HA commands
@@ -1170,39 +1240,46 @@ def main() -> None:
                             if st_local.get("enabled") is True:
                                 changed = False
                                 now_epoch = int(time.time())
+                                
                                 max_dur = cfg.get("max_open_window_duration")
 
-
-                                # Presence (HOME/AWAY) enforcement via presenceLock
+                                # --- Presence Auto-Assist (HOME/AWAY) ---
                                 try:
-                                    at_home_flags = []
-                                    for d in (mobile_devices or []):
-                                        loc = d.get("location") or {}
-                                        if "atHome" in loc:
-                                            at_home_flags.append(bool(loc.get("atHome")))
-                                        else:
-                                            at_home_flags.append(None)
+                                    desired_presence = compute_desired_home_presence(devices)
+                                    current_presence = get_home_presence(access_token, home_id)
 
-                                    desired_presence = None
-                                    if any(v is True for v in at_home_flags):
-                                        desired_presence = "HOME"
-                                    elif any(v is False for v in at_home_flags) and not any(v is True for v in at_home_flags):
-                                        desired_presence = "AWAY"
+                                    st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
+                                    st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
+                                    st_local["last_run"] = now_iso()
 
-                                    if desired_presence:
-                                        home_state = get_home_state(access_token, home_id)
-                                        current_presence = (home_state.get("presence") or "").upper().strip()
-                                        if current_presence in ("HOME", "AWAY")  and current_presence != desired_presence:
+                                    if desired_presence in ("HOME", "AWAY"):
+                                        if current_presence != desired_presence:
                                             set_presence_lock(access_token, home_id, desired_presence)
-                                            st_local["last_action"] = f"presence_lock:{desired_presence}"
-                                            st_local["last_error"] = ""
-                                            changed = True
+                                            current_presence = desired_presence
+                                            st_local["presence_current"] = desired_presence
+                                            st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
+                                            st_local["last_error"] = None
+                                        else:
+                                            st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
+                                            st_local["last_error"] = None
+                                    else:
+                                        st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
+                                        st_local["last_error"] = None
+
+                                    changed = True
                                 except Exception as e:
-                                    st_local["last_action"] = "presence_lock:error"
+                                    st_local["last_run"] = now_iso()
+                                    st_local["last_action"] = f"presence_error:home{home_id}"
                                     st_local["last_error"] = str(e)
                                     changed = True
 
+                                if changed:
+                                    write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
+                                    publish_auto_assist(mpub, cfg, st_local)
+                                    changed = False
+
                                 for zid, zstate in zone_states:
+
                                     detected = zone_open_window_detected(zstate)
                                     key = (home_id, zid)
                                     try:
