@@ -1083,6 +1083,12 @@ def main() -> None:
     cfg = load_config()
 
     poll = int(cfg["poll_seconds"])
+    # Open-window polling can be more expensive (multiple zone state calls).
+    # Use a dedicated interval and default to a slower cadence to avoid 429s.
+    try:
+        open_window_poll_seconds = int(cfg.get("open_window_poll_seconds", max(300, poll * 5)))
+    except Exception:
+        open_window_poll_seconds = max(300, poll * 5)
 
     # Open-Window runtime caches
     zones_cache: Dict[int, List[Dict[str, Any]]] = {}
