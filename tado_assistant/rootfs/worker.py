@@ -35,6 +35,11 @@ TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 HTTP_TIMEOUT = 20
 DEFAULT_POLL_SECONDS = 300
+MIN_POLL_SECONDS = 600  # safety: avoid Tado API 429, esp. if another integration is polling
+DEFAULT_OPEN_WINDOW_POLL_SECONDS = 900
+MIN_OPEN_WINDOW_POLL_SECONDS = 300
+DEFAULT_ZONES_REFRESH_SECONDS = 21600  # 6h
+MIN_ZONES_REFRESH_SECONDS = 3600
 
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
@@ -1195,11 +1200,11 @@ def main() -> None:
                 # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
                 if cfg.get("enable_open_window"):
                     now_t = time.time()
-                    if now_t - open_window_last_poll.get(home_id, 0) >= float(cfg.get("open_window_poll_seconds", poll)):
+                    if now_t - open_window_last_poll.get(home_id, 0) >= open_window_poll_seconds:
                         open_window_last_poll[home_id] = now_t
 
                         # refresh zones list occasionally
-                        if now_t - zones_last_refresh.get(home_id, 0) >= float(cfg.get("zones_refresh_seconds", 3600)):
+                        if now_t - zones_last_refresh.get(home_id, 0) >= zones_refresh_seconds:
                             zones_cache[home_id] = get_zones(access_token, home_id)
                             zones_last_refresh[home_id] = now_t
 
