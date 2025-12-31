@@ -347,13 +347,16 @@ def _is_token_expired_payload(data: Any) -> bool:
     return False
 
 
-def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
+def api_request(method: str, path: str, access_token: str, params: Optional[dict] = None, json_body: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
     """Call Tado API and (once) auto-refresh token if we get 401 'access token is expired'."""
     url = f"{API_BASE}{path}"
 
     def _do_request(tok: str) -> Tuple[int, Any, Dict[str, str]]:
         headers = {"Authorization": f"Bearer {tok}"}
-        r = requests.request(method, url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+        kwargs = dict(method=method, url=url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+        if json_body is not None:
+            kwargs["json"] = json_body
+        r = requests.request(**kwargs)
         resp_headers = {k: v for k, v in r.headers.items()}
         try:
             data = r.json()
@@ -485,6 +488,26 @@ def cancel_open_window(access_token: str, home_id: int, zone_id: int) -> None:
         raise RateLimitError(f"/homes/{home_id}/zones/{zone_id}/state/openWindow", parse_retry_after(headers))
     if status not in (200, 204):
         raise RuntimeError(f"cancel openWindow failed status={status} data={data}")
+
+def get_home_state(access_token: str, home_id: int) -> Dict[str, Any]:
+    """GET /api/v2/homes/{home_id}/state"""
+    status, data, headers = api_request("GET", f"/homes/{home_id}/state", access_token)
+    if status != 200:
+        raise RuntimeError(f"GET /homes/{home_id}/state failed: {status} {data}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected home state payload: {data!r}")
+    return data
+
+
+def set_presence_lock(access_token: str, home_id: int, presence: str) -> None:
+    """PUT /api/v2/homes/{home_id}/presenceLock with {"homePresence":"HOME|AWAY"}"""
+    presence = presence.upper().strip()
+    if presence not in ("HOME", "AWAY"):
+        raise ValueError(f"invalid presence {presence!r}")
+    status, data, headers = api_request("PUT", f"/homes/{home_id}/presenceLock", access_token, json_body={"homePresence": presence})
+    if status not in (200, 204):
+        raise RuntimeError(f"PUT /homes/{home_id}/presenceLock failed: {status} {data}")
+
 def _obtained_epoch(tokens: Dict[str, Any]) -> Optional[int]:
     if "_obtained_at_epoch" in tokens:
         try:
@@ -1148,6 +1171,36 @@ def main() -> None:
                                 changed = False
                                 now_epoch = int(time.time())
                                 max_dur = cfg.get("max_open_window_duration")
+
+
+                                # Presence (HOME/AWAY) enforcement via presenceLock
+                                try:
+                                    at_home_flags = []
+                                    for d in (mobile_devices or []):
+                                        loc = d.get("location") or {}
+                                        if "atHome" in loc:
+                                            at_home_flags.append(bool(loc.get("atHome")))
+                                        else:
+                                            at_home_flags.append(None)
+
+                                    desired_presence = None
+                                    if any(v is True for v in at_home_flags):
+                                        desired_presence = "HOME"
+                                    elif any(v is False for v in at_home_flags) and not any(v is True for v in at_home_flags):
+                                        desired_presence = "AWAY"
+
+                                    if desired_presence:
+                                        home_state = get_home_state(access_token, home_id)
+                                        current_presence = (home_state.get("presence") or "").upper().strip()
+                                        if current_presence in ("HOME", "AWAY")  and current_presence != desired_presence:
+                                            set_presence_lock(access_token, home_id, desired_presence)
+                                            st_local["last_action"] = f"presence_lock:{desired_presence}"
+                                            st_local["last_error"] = ""
+                                            changed = True
+                                except Exception as e:
+                                    st_local["last_action"] = "presence_lock:error"
+                                    st_local["last_error"] = str(e)
+                                    changed = True
 
                                 for zid, zstate in zone_states:
                                     detected = zone_open_window_detected(zstate)
