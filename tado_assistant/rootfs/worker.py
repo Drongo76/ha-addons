@@ -737,14 +737,13 @@ def publish_discovery_for_devices(
 
         tracker_config_topic = f"{discovery_prefix}/device_tracker/{tracker_object_id}/config"
         tracker_payload = {
-            "name": f"{name}",
+            "name": f"👤 {name}",
             "unique_id": f"{ha_device_id}_home_{home_id}_device_{did_int}_tracker",
             "state_topic": state_topic,
             "payload_home": "home",
             "payload_not_home": "not_home",
             "source_type": "gps",
-            "entity_category": "config",
-            "device": main_device_block,
+"device": main_device_block,
         }
         mpub.publish_json(tracker_config_topic, tracker_payload, retain=True)
 
@@ -843,7 +842,7 @@ def publish_open_window_discovery(
         state_topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid_int}/state"
 
         payload = {
-            "name": f"Fenster – {zname}",
+            "name": f"🪟 Fenster – {zname}",
             "unique_id": f"{ha_device_id}_home_{home_id}_zone_{zid_int}_open_window",
             "state_topic": state_topic,
             "payload_on": "ON",
