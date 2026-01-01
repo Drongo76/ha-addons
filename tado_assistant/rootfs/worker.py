@@ -1090,6 +1090,14 @@ def main() -> None:
     except Exception:
         open_window_poll_seconds = max(300, poll * 5)
 
+    # Zones refresh interval for open-window discovery (s).
+    try:
+        zones_refresh_seconds = int(cfg.get("zones_refresh_seconds", 3600))
+    except Exception:
+        zones_refresh_seconds = 3600
+    if zones_refresh_seconds < 300:
+        zones_refresh_seconds = 300
+
     # Open-Window runtime caches
     zones_cache: Dict[int, List[Dict[str, Any]]] = {}
     zones_last_refresh: Dict[int, float] = {}
