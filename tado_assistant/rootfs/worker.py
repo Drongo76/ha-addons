@@ -132,7 +132,7 @@ def load_config() -> Dict[str, Any]:
     enable_open_window = opt.get("enable_open_window", True)
     enable_open_window = bool(enable_open_window)
 
-    open_window_poll_seconds = opt.get("open_window_poll_seconds", 300)
+    open_window_poll_seconds = opt.get("open_window_poll_seconds", max(90, poll * 3))
     if open_window_poll_seconds in ("", None):
         open_window_poll_seconds = poll
     try:
@@ -499,59 +499,86 @@ def get_zone_state(access_token: str, home_id: int, zone_id: int) -> Dict[str, A
     return data if isinstance(data, dict) else {}
 
 
-def zone_open_window_detected(zone_state: Dict[str, Any]) -> bool:
-    # Tado APIs have changed over time; open-window status can appear in different shapes.
+def zone_open_window_detected(zone_state: dict) -> bool:
+    """Best-effort Open-Window-Erkennung (Tado API ist je nach Konto/Firmware leicht unterschiedlich)."""
     if not isinstance(zone_state, dict):
         return False
 
-    # 1) Classic flag
+    def _is_true(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            # Zahl alleine ist meist kein sicherer Indikator; nur 1/0 interpretieren.
+            return v == 1
+        if isinstance(v, str):
+            s = v.strip().lower()
+            return s in {"true", "on", "open", "opened", "yes", "active", "detected", "1"}
+        return False
+
+    # 1) Häufigster Key (bekannt aus /zones/{id}/state)
     v = zone_state.get("openWindowDetected")
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        vs = v.strip().lower()
-        if vs in ("true", "false"):
-            return vs == "true"
-
-    # 2) Newer shapes: openWindow object
-    ow = zone_state.get("openWindow")
-    if isinstance(ow, dict):
-        for k in ("detected", "activated", "openWindowDetected"):
-            vv = ow.get(k)
-            if isinstance(vv, bool):
-                return vv
-            if isinstance(vv, str):
-                vvs = vv.strip().lower()
-                if vvs in ("true", "false"):
-                    return vvs == "true"
-        # Heuristic: when active, Tado often provides timing/expiry fields.
-        if any(k in ow for k in ("expiry", "remainingTimeInSeconds", "durationInSeconds", "minutes")):
-            # If any of these fields exist and are non-empty, assume active.
-            for k in ("expiry", "remainingTimeInSeconds", "durationInSeconds", "minutes"):
-                if ow.get(k):
-                    return True
-
-    # 3) Overlay type can signal an active open-window mode
-    ot = zone_state.get("overlayType") or zone_state.get("overlay_type")
-    if isinstance(ot, str) and ot.strip().upper() == "OPEN_WINDOW":
+    if _is_true(v):
         return True
 
+    # 2) Manche Antworten nutzen ein Objekt "openWindow"
+    ow = zone_state.get("openWindow")
+    if isinstance(ow, dict):
+        for k in (
+            "openWindowDetected",
+            "detected",
+            "isDetected",
+            "isOpen",
+            "open",
+            "active",
+            "isActive",
+            "enabled",
+            "isEnabled",
+            "state",
+            "status",
+        ):
+            if k in ow:
+                vv = ow.get(k)
+                if _is_true(vv):
+                    return True
+                if isinstance(vv, str) and ("open_window" in vv.lower() or "openwindow" in vv.lower() or "open" == vv.lower()):
+                    return True
+
+    # 3) Overlay / Reason (bei aktivem Open-Window-Overlay taucht oft OPEN_WINDOW in Strings auf)
     overlay = zone_state.get("overlay")
     if isinstance(overlay, dict):
-        t = overlay.get("type") or overlay.get("overlayType")
-        if isinstance(t, str) and t.strip().upper() == "OPEN_WINDOW":
-            return True
+        for k in ("type", "overlayType", "reason", "terminationReason"):
+            vv = overlay.get(k)
+            if isinstance(vv, str) and "OPEN_WINDOW" in vv.upper():
+                return True
         term = overlay.get("termination")
         if isinstance(term, dict):
-            tt = term.get("type")
-            if isinstance(tt, str) and tt.strip().upper() == "OPEN_WINDOW":
+            vv = term.get("type")
+            if isinstance(vv, str) and "OPEN_WINDOW" in vv.upper():
                 return True
 
-    term = zone_state.get("termination")
-    if isinstance(term, dict):
-        tt = term.get("type")
-        if isinstance(tt, str) and tt.strip().upper() == "OPEN_WINDOW":
+    for k in ("overlayType", "reason", "terminationReason"):
+        vv = zone_state.get(k)
+        if isinstance(vv, str) and "OPEN_WINDOW" in vv.upper():
             return True
+
+    # 4) Fallback: rekursiv nach OPEN_WINDOW-Strings oder openWindow*-Leaf-Keys suchen
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for kk, vv in obj.items():
+                yield kk, vv
+                yield from _walk(vv)
+        elif isinstance(obj, list):
+            for vv in obj:
+                yield from _walk(vv)
+
+    for kk, vv in _walk(zone_state):
+        kkl = str(kk).lower()
+        if isinstance(vv, str) and "open_window" in vv.lower():
+            return True
+        if "openwindow" in kkl and kkl not in {"openwindowdetection"}:
+            # nur Leaf-Werte auswerten
+            if not isinstance(vv, (dict, list)) and _is_true(vv):
+                return True
 
     return False
 def activate_open_window(access_token: str, home_id: int, zone_id: int) -> None:
