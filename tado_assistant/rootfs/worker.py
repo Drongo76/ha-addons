@@ -500,21 +500,60 @@ def get_zone_state(access_token: str, home_id: int, zone_id: int) -> Dict[str, A
 
 
 def zone_open_window_detected(zone_state: Dict[str, Any]) -> bool:
+    # Tado APIs have changed over time; open-window status can appear in different shapes.
+    if not isinstance(zone_state, dict):
+        return False
+
+    # 1) Classic flag
     v = zone_state.get("openWindowDetected")
     if isinstance(v, bool):
         return v
     if isinstance(v, str):
-        return v.strip().lower() == "true"
-    if isinstance(v, dict):
-        for k in ("detected", "value", "openWindowDetected"):
-            vv = v.get(k)
+        vs = v.strip().lower()
+        if vs in ("true", "false"):
+            return vs == "true"
+
+    # 2) Newer shapes: openWindow object
+    ow = zone_state.get("openWindow")
+    if isinstance(ow, dict):
+        for k in ("detected", "activated", "openWindowDetected"):
+            vv = ow.get(k)
             if isinstance(vv, bool):
                 return vv
-            if isinstance(vv, str) and vv.strip().lower() in ("true", "false"):
-                return vv.strip().lower() == "true"
+            if isinstance(vv, str):
+                vvs = vv.strip().lower()
+                if vvs in ("true", "false"):
+                    return vvs == "true"
+        # Heuristic: when active, Tado often provides timing/expiry fields.
+        if any(k in ow for k in ("expiry", "remainingTimeInSeconds", "durationInSeconds", "minutes")):
+            # If any of these fields exist and are non-empty, assume active.
+            for k in ("expiry", "remainingTimeInSeconds", "durationInSeconds", "minutes"):
+                if ow.get(k):
+                    return True
+
+    # 3) Overlay type can signal an active open-window mode
+    ot = zone_state.get("overlayType") or zone_state.get("overlay_type")
+    if isinstance(ot, str) and ot.strip().upper() == "OPEN_WINDOW":
+        return True
+
+    overlay = zone_state.get("overlay")
+    if isinstance(overlay, dict):
+        t = overlay.get("type") or overlay.get("overlayType")
+        if isinstance(t, str) and t.strip().upper() == "OPEN_WINDOW":
+            return True
+        term = overlay.get("termination")
+        if isinstance(term, dict):
+            tt = term.get("type")
+            if isinstance(tt, str) and tt.strip().upper() == "OPEN_WINDOW":
+                return True
+
+    term = zone_state.get("termination")
+    if isinstance(term, dict):
+        tt = term.get("type")
+        if isinstance(tt, str) and tt.strip().upper() == "OPEN_WINDOW":
+            return True
+
     return False
-
-
 def activate_open_window(access_token: str, home_id: int, zone_id: int) -> None:
     status, data, headers = api_request(
         "POST",
