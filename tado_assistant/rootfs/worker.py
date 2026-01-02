@@ -53,6 +53,17 @@ AUTO_ASSIST_SET_TOPIC = "auto_assist/set"       # payload: ON/OFF
 AUTO_ASSIST_ATTRS_TOPIC = "auto_assist/attrs"   # JSON: last_run/last_action/last_error
 AUTO_ASSIST_STATUS_TOPIC = "auto_assist/status"  # text: OFF / ON · HOME / ON · AWAY / ON · UNKNOWN
 
+# Open-Window timer controls (MQTT Number entities under "Steuerelemente")
+OPEN_WINDOW_SETTINGS_PATH = os.path.join(DATA_DIR, "tado_assistant_open_window_settings.json")
+DEFAULT_OPEN_WINDOW_OFF_MINUTES = 15       # Window open => heating off for at least X minutes
+DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES = 5   # After window closes => keep off for X minutes
+
+# relative to topic_prefix
+OPEN_WINDOW_OFF_MIN_STATE_TOPIC = "auto_assist/open_window_off_minutes/state"
+OPEN_WINDOW_OFF_MIN_SET_TOPIC   = "auto_assist/open_window_off_minutes/set"
+OPEN_WINDOW_FOLLOW_MIN_STATE_TOPIC = "auto_assist/open_window_followup_minutes/state"
+OPEN_WINDOW_FOLLOW_MIN_SET_TOPIC   = "auto_assist/open_window_followup_minutes/set"
+
 
 # -----------------------------
 # Small helpers
@@ -709,6 +720,111 @@ def boot_auto_assist_force_off() -> Dict[str, Any]:
 
 
 
+
+
+# -----------------------------
+# Open-Window timer settings (persisted in /data + controlled via MQTT Number entities)
+# -----------------------------
+def clamp_int(v: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        iv = int(float(str(v).strip()))
+    except Exception:
+        iv = default
+    if iv < lo:
+        iv = lo
+    if iv > hi:
+        iv = hi
+    return iv
+
+
+def read_open_window_settings() -> Dict[str, int]:
+    st = read_json(OPEN_WINDOW_SETTINGS_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    off_min = clamp_int(st.get("off_minutes", DEFAULT_OPEN_WINDOW_OFF_MINUTES), 5, 120, DEFAULT_OPEN_WINDOW_OFF_MINUTES)
+    follow_min = clamp_int(st.get("followup_minutes", DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES), 0, 60, DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES)
+    return {"off_minutes": off_min, "followup_minutes": follow_min}
+
+
+def write_open_window_settings(st: Dict[str, int]) -> None:
+    out = {
+        "off_minutes": clamp_int(st.get("off_minutes", DEFAULT_OPEN_WINDOW_OFF_MINUTES), 5, 120, DEFAULT_OPEN_WINDOW_OFF_MINUTES),
+        "followup_minutes": clamp_int(st.get("followup_minutes", DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES), 0, 60, DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES),
+    }
+    write_json_atomic(OPEN_WINDOW_SETTINGS_PATH, out)
+
+
+def publish_open_window_settings_discovery(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
+    """Publish two Number entities under 'Steuerelemente' (same device)."""
+    if not mpub.client:
+        return
+
+    dp = cfg["discovery_prefix"]
+    tp = cfg["topic_prefix"]
+    ha_device_id = cfg["ha_device_id"]
+
+    device_block = {
+        "identifiers": [ha_device_id],
+        "name": cfg["ha_device_name"],
+        "manufacturer": "tado°",
+        "model": "Tado Assistant (Ingress)",
+    }
+
+    # 1) Off minutes
+    off_cfg_topic = f"{dp}/number/{ha_device_id}/open_window_off_minutes/config"
+    mpub.publish_json(
+        off_cfg_topic,
+        {
+            "name": "Fenster-Aus (Minuten)",
+            "unique_id": f"{ha_device_id}_open_window_off_minutes",
+            "state_topic": f"{tp}/{OPEN_WINDOW_OFF_MIN_STATE_TOPIC}",
+            "command_topic": f"{tp}/{OPEN_WINDOW_OFF_MIN_SET_TOPIC}",
+            "availability_topic": f"{tp}/_status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "min": 5,
+            "max": 120,
+            "step": 1,
+            "mode": "box",
+            "unit_of_measurement": "min",
+            "icon": "mdi:timer-outline",
+            "device": device_block,
+        },
+        retain=True,
+    )
+
+    # 2) Follow-up minutes
+    follow_cfg_topic = f"{dp}/number/{ha_device_id}/open_window_followup_minutes/config"
+    mpub.publish_json(
+        follow_cfg_topic,
+        {
+            "name": "Fenster-Nachlauf (Minuten)",
+            "unique_id": f"{ha_device_id}_open_window_followup_minutes",
+            "state_topic": f"{tp}/{OPEN_WINDOW_FOLLOW_MIN_STATE_TOPIC}",
+            "command_topic": f"{tp}/{OPEN_WINDOW_FOLLOW_MIN_SET_TOPIC}",
+            "availability_topic": f"{tp}/_status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "min": 0,
+            "max": 60,
+            "step": 1,
+            "mode": "box",
+            "unit_of_measurement": "min",
+            "icon": "mdi:timer-sand",
+            "device": device_block,
+        },
+        retain=True,
+    )
+
+
+def publish_open_window_settings_state(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, int]) -> None:
+    if not mpub.client:
+        return
+    tp = cfg["topic_prefix"]
+    mpub.publish(f"{tp}/{OPEN_WINDOW_OFF_MIN_STATE_TOPIC}", str(st.get("off_minutes", DEFAULT_OPEN_WINDOW_OFF_MINUTES)), retain=True)
+    mpub.publish(f"{tp}/{OPEN_WINDOW_FOLLOW_MIN_STATE_TOPIC}", str(st.get('followup_minutes', DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES)), retain=True)
+
+
 def publish_auto_assist(mpub: MqttPub, cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
     if not mpub.client:
         return
@@ -1168,7 +1284,7 @@ def main() -> None:
     zones_cache: Dict[int, List[Dict[str, Any]]] = {}
     zones_last_refresh: Dict[int, float] = {}
     open_window_last_poll: Dict[int, float] = {}
-    open_window_activations: Dict[Tuple[int, int], int] = {}
+    open_window_runtime: Dict[Tuple[int, int], Dict[str, Any]] = {}
     topic_prefix = cfg["topic_prefix"]
     discovery_prefix = cfg["discovery_prefix"]
     ha_device_name = cfg["ha_device_name"]
@@ -1183,28 +1299,52 @@ def main() -> None:
     mpub = MqttPub(cfg["mqtt"])
 
     def handle_mqtt_message(topic: str, payload: str) -> None:
-        wanted = f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}"
-        if topic != wanted:
-            return
+        # 1) Auto-Assist switch
+        wanted_switch = f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}"
+        wanted_off = f"{topic_prefix}/{OPEN_WINDOW_OFF_MIN_SET_TOPIC}"
+        wanted_follow = f"{topic_prefix}/{OPEN_WINDOW_FOLLOW_MIN_SET_TOPIC}"
 
-        cmd = (payload or "").strip().upper()
-        st = read_auto_assist_runtime()
+        if topic == wanted_switch:
+            cmd = (payload or "").strip().upper()
+            st = read_auto_assist_runtime()
 
-        if cmd not in ("ON", "OFF"):
-            st["last_error"] = f"invalid command payload: '{payload}'"
-            st["last_action"] = "reject_command"
+            if cmd not in ("ON", "OFF"):
+                st["last_error"] = f"invalid command payload: '{payload}'"
+                st["last_action"] = "reject_command"
+                st["last_run"] = now_iso()
+                write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
+                publish_auto_assist(mpub, cfg, st)
+                return
+
+            st["enabled"] = (cmd == "ON")
+            st["last_action"] = "switch_on" if st["enabled"] else "switch_off"
+            st["last_error"] = None
             st["last_run"] = now_iso()
             write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
             publish_auto_assist(mpub, cfg, st)
+            log(f"Auto-Assist switched {cmd}")
             return
 
-        st["enabled"] = (cmd == "ON")
-        st["last_action"] = "switch_on" if st["enabled"] else "switch_off"
-        st["last_error"] = None
-        st["last_run"] = now_iso()
-        write_json_atomic(AUTO_ASSIST_STATE_PATH, st)
-        publish_auto_assist(mpub, cfg, st)
-        log(f"Auto-Assist switched {cmd}")
+        # 2) Open-Window timer controls
+        if topic == wanted_off or topic == wanted_follow:
+            st = read_open_window_settings()
+            if topic == wanted_off:
+                val = clamp_int(payload, 5, 120, DEFAULT_OPEN_WINDOW_OFF_MINUTES)
+                st["off_minutes"] = val
+                write_open_window_settings(st)
+                publish_open_window_settings_state(mpub, cfg, st)
+                log(f"Open-Window setting updated: off_minutes={val}")
+            else:
+                val = clamp_int(payload, 0, 60, DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES)
+                st["followup_minutes"] = val
+                write_open_window_settings(st)
+                publish_open_window_settings_state(mpub, cfg, st)
+                log(f"Open-Window setting updated: followup_minutes={val}")
+            return
+
+        # ignore other topics
+        return
+
 
     mpub.set_on_message(handle_mqtt_message)
 
@@ -1220,8 +1360,21 @@ def main() -> None:
         publish_auto_assist_status_discovery(mpub, cfg)
         publish_auto_assist(mpub, cfg, read_auto_assist_runtime())
 
+        # Open-Window timer controls (Numbers under Steuerelemente)
+        try:
+            ow = read_open_window_settings()
+            # ensure defaults persist
+            write_open_window_settings(ow)
+            publish_open_window_settings_discovery(mpub, cfg)
+            publish_open_window_settings_state(mpub, cfg, ow)
+        except Exception as e:
+            log(f"WARN: open-window settings publish failed: {e}")
+
+
         # Subscribe to HA commands
         mpub.subscribe(f"{topic_prefix}/{AUTO_ASSIST_SET_TOPIC}")
+        mpub.subscribe(f"{topic_prefix}/{OPEN_WINDOW_OFF_MIN_SET_TOPIC}")
+        mpub.subscribe(f"{topic_prefix}/{OPEN_WINDOW_FOLLOW_MIN_SET_TOPIC}")
 
         log("auto-assist: discovery+state published; command subscribed")
 
@@ -1325,8 +1478,6 @@ def main() -> None:
                             if st_local.get("enabled") is True:
                                 changed = False
                                 now_epoch = int(time.time())
-                                
-                                max_dur = cfg.get("max_open_window_duration")
 
                                 # --- Presence Auto-Assist (HOME/AWAY) ---
                                 try:
@@ -1363,37 +1514,52 @@ def main() -> None:
                                     publish_auto_assist(mpub, cfg, st_local)
                                     changed = False
 
-                                for zid, zstate in zone_states:
+                                                                # Open-Window Auto-Assist (timed like tado app: off_minutes + followup_minutes)
+                                ow = read_open_window_settings()
+                                off_min = int(ow.get('off_minutes', DEFAULT_OPEN_WINDOW_OFF_MINUTES))
+                                follow_min = int(ow.get('followup_minutes', DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES))
+                                off_sec = max(0, off_min) * 60
+                                follow_sec = max(0, follow_min) * 60
+                                reactivate_every = max(180, min(900, off_sec // 2 if off_sec else 300))
 
+                                for zid, zstate in zone_states:
                                     detected = zone_open_window_detected(zstate)
                                     key = (home_id, zid)
+                                    rt = open_window_runtime.get(key)
                                     try:
                                         if detected:
-                                            if key not in open_window_activations:
-                                                activate_open_window(access_token, home_id, zid)
-                                                open_window_activations[key] = now_epoch
-                                                st_local["last_action"] = f"open_window_activate:home{home_id}_zone{zid}"
-                                                st_local["last_run"] = now_iso()
-                                                st_local["last_error"] = None
-                                                changed = True
+                                            if rt is None:
+                                                rt = {'first_open': now_epoch, 'target_end': now_epoch + off_sec, 'closed_since': None, 'last_activate': 0}
+                                                open_window_runtime[key] = rt
                                             else:
-                                                if isinstance(max_dur, int) and max_dur > 0:
-                                                    if now_epoch - open_window_activations.get(key, now_epoch) > max_dur:
-                                                        cancel_open_window(access_token, home_id, zid)
-                                                        open_window_activations.pop(key, None)
-                                                        st_local["last_action"] = f"open_window_cancel:home{home_id}_zone{zid}"
-                                                        st_local["last_run"] = now_iso()
-                                                        st_local["last_error"] = None
-                                                        changed = True
+                                                rt['closed_since'] = None
+                                                rt['target_end'] = max(int(rt.get('target_end', now_epoch)), now_epoch + off_sec)
+                                            # Activate (and occasionally re-activate) Open Window mode to ensure heating stays off while window is open
+                                            if now_epoch - int(rt.get('last_activate', 0)) >= reactivate_every:
+                                                activate_open_window(access_token, home_id, zid)
+                                                rt['last_activate'] = now_epoch
+                                                st_local['last_action'] = f"open_window_activate:home{home_id}_zone{zid}"
+                                                st_local['last_run'] = now_iso()
+                                                st_local['last_error'] = None
+                                                changed = True
                                         else:
-                                            if key in open_window_activations:
-                                                open_window_activations.pop(key, None)
+                                            if rt is not None:
+                                                if rt.get('closed_since') is None:
+                                                    rt['closed_since'] = now_epoch
+                                                end_time = max(int(rt.get('target_end', now_epoch)), int(rt.get('closed_since', now_epoch)) + follow_sec)
+                                                # Only cancel when window is closed AND timers are satisfied
+                                                if now_epoch >= end_time:
+                                                    cancel_open_window(access_token, home_id, zid)
+                                                    open_window_runtime.pop(key, None)
+                                                    st_local['last_action'] = f"open_window_cancel:home{home_id}_zone{zid}"
+                                                    st_local['last_run'] = now_iso()
+                                                    st_local['last_error'] = None
+                                                    changed = True
                                     except Exception as e:
-                                        st_local["last_run"] = now_iso()
-                                        st_local["last_action"] = f"open_window_error:home{home_id}_zone{zid}"
-                                        st_local["last_error"] = str(e)
+                                        st_local['last_run'] = now_iso()
+                                        st_local['last_action'] = f"open_window_error:home{home_id}_zone{zid}"
+                                        st_local['last_error'] = str(e)
                                         changed = True
-
                                 if changed:
                                     write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
                                     publish_auto_assist(mpub, cfg, st_local)
