@@ -1,5 +1,5 @@
 name: "Tado Assistant (Ingress)"
-version: "0.9.9"
+version: "1.0.0"
 slug: tado_assistant
 description: "Tado Assistant"
 
