@@ -35,9 +35,9 @@ TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 HTTP_TIMEOUT = 20
 DEFAULT_POLL_SECONDS = 300
-MIN_POLL_SECONDS = 600  # safety: avoid Tado API 429, esp. if another integration is polling
+MIN_POLL_SECONDS = 10  # minimal sanity clamp (allow user to set e.g. 300)
 DEFAULT_OPEN_WINDOW_POLL_SECONDS = 900
-MIN_OPEN_WINDOW_POLL_SECONDS = 300
+MIN_OPEN_WINDOW_POLL_SECONDS = 10  # minimal sanity clamp
 DEFAULT_ZONES_REFRESH_SECONDS = 21600  # 6h
 MIN_ZONES_REFRESH_SECONDS = 3600
 
@@ -1171,7 +1171,6 @@ def publish_open_window_states(
         detected = zone_open_window_detected(zstate)
         topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid}/state"
         mpub.publish(topic, "ON" if detected else "OFF", retain=True)
-
 def publish_presence(
     mpub: MqttPub,
     topic_prefix: str,
@@ -1420,6 +1419,45 @@ def main() -> None:
 
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
+                # Auto-Assist actions (Presence: HOME/AWAY)
+                st_local = read_auto_assist_runtime()
+                if st_local.get("enabled") is True:
+                    changed = False
+                    # --- Presence Auto-Assist (HOME/AWAY) ---
+                    try:
+                        desired_presence = compute_desired_home_presence(devices)
+                        current_presence = get_home_presence(access_token, home_id)
+
+                        st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
+                        st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
+                        st_local["last_run"] = now_iso()
+
+                        if desired_presence in ("HOME", "AWAY"):
+                            if current_presence != desired_presence:
+                                set_presence_lock(access_token, home_id, desired_presence)
+                                current_presence = desired_presence
+                                st_local["presence_current"] = desired_presence
+                                st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
+                                st_local["last_error"] = None
+                            else:
+                                st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
+                                st_local["last_error"] = None
+                        else:
+                            st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
+                            st_local["last_error"] = None
+
+                        changed = True
+                    except Exception as e:
+                        st_local["last_run"] = now_iso()
+                        st_local["last_action"] = f"presence_error:home{home_id}"
+                        st_local["last_error"] = str(e)
+                        changed = True
+
+                    if changed:
+                        write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
+                        publish_auto_assist(mpub, cfg, st_local)
+                        changed = False
+
 
 
                 # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
@@ -1470,41 +1508,6 @@ def main() -> None:
                             if st_local.get("enabled") is True:
                                 changed = False
                                 now_epoch = int(time.time())
-
-                                # --- Presence Auto-Assist (HOME/AWAY) ---
-                                try:
-                                    desired_presence = compute_desired_home_presence(devices)
-                                    current_presence = get_home_presence(access_token, home_id)
-
-                                    st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
-                                    st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
-                                    st_local["last_run"] = now_iso()
-
-                                    if desired_presence in ("HOME", "AWAY"):
-                                        if current_presence != desired_presence:
-                                            set_presence_lock(access_token, home_id, desired_presence)
-                                            current_presence = desired_presence
-                                            st_local["presence_current"] = desired_presence
-                                            st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
-                                            st_local["last_error"] = None
-                                        else:
-                                            st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
-                                            st_local["last_error"] = None
-                                    else:
-                                        st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
-                                        st_local["last_error"] = None
-
-                                    changed = True
-                                except Exception as e:
-                                    st_local["last_run"] = now_iso()
-                                    st_local["last_action"] = f"presence_error:home{home_id}"
-                                    st_local["last_error"] = str(e)
-                                    changed = True
-
-                                if changed:
-                                    write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
-                                    publish_auto_assist(mpub, cfg, st_local)
-                                    changed = False
 
                                                                 # Open-Window Auto-Assist (timed like tado app: off_minutes + followup_minutes)
                                 ow = read_open_window_settings()
