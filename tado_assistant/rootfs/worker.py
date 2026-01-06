@@ -134,7 +134,7 @@ def load_config() -> Dict[str, Any]:
         poll = int(poll)
     except Exception:
         poll = DEFAULT_POLL_SECONDS
-    poll = max(10, poll)
+    poll = max(MIN_POLL_SECONDS, poll)
 
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
     enable_raw_sensors = bool(enable_raw_sensors)
@@ -150,14 +150,14 @@ def load_config() -> Dict[str, Any]:
         open_window_poll_seconds = int(open_window_poll_seconds)
     except Exception:
         open_window_poll_seconds = poll
-    open_window_poll_seconds = max(10, open_window_poll_seconds)
+    open_window_poll_seconds = max(MIN_OPEN_WINDOW_POLL_SECONDS, open_window_poll_seconds)
 
     zones_refresh_seconds = opt.get("zones_refresh_seconds", 3600)
     try:
         zones_refresh_seconds = int(zones_refresh_seconds)
     except Exception:
         zones_refresh_seconds = 3600
-    zones_refresh_seconds = max(300, zones_refresh_seconds)
+    zones_refresh_seconds = max(MIN_ZONES_REFRESH_SECONDS, zones_refresh_seconds)
 
     max_open_window_duration = opt.get("max_open_window_duration")
     if max_open_window_duration in ("", None):
@@ -1060,15 +1060,6 @@ def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
     write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
 
 
-def _load_open_window_discovery_state() -> Dict[str, Any]:
-    st = read_json(OPEN_WINDOW_DISCOVERY_STATE_PATH)
-    if isinstance(st, dict):
-        return st
-    return {"homes": {}}
-
-
-def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
-    write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
 
 
 def publish_open_window_discovery(
@@ -1180,6 +1171,7 @@ def publish_open_window_states(
         detected = zone_open_window_detected(zstate)
         topic = f"{topic_prefix}/open_window/home_{home_id}/zone_{zid}/state"
         mpub.publish(topic, "ON" if detected else "OFF", retain=True)
+
 def publish_presence(
     mpub: MqttPub,
     topic_prefix: str,
@@ -1198,7 +1190,7 @@ def publish_presence(
 
     if enable_raw_sensors:
         agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
-                # Overall home presence state: home if any device is home, not_home if all are not_home, else unknown
+        # Overall home presence state: home if any device is home, not_home if all are not_home, else unknown
         states = [str(d.get("state", "unknown")) for d in devices if isinstance(d, dict)]
         if any(s == "home" for s in states):
             home_state = "home"
