@@ -23,6 +23,7 @@ CACHE_DIR = DATA_DIR  # use /data for any persistent worker state
 TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
 LAST_DEVICES_PATH = os.path.join(DATA_DIR, "tado_assistant_last_devices.json")
+RATE_LIMIT_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_rate_limit.json")
 
 # Auto-Assist runtime (enabled is forced OFF on every boot)
 AUTO_ASSIST_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_auto_assist_state.json")
@@ -96,6 +97,33 @@ def write_json_atomic(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+
+def load_rate_limit_state() -> Dict[str, Any]:
+    st = read_json(RATE_LIMIT_STATE_PATH)
+    return st if isinstance(st, dict) else {}
+
+def save_rate_limit_state(st: Dict[str, Any]) -> None:
+    try:
+        write_json_atomic(RATE_LIMIT_STATE_PATH, st)
+    except Exception:
+        pass
+
+def set_rate_limit_until(key: str, until_ts: float, path: Optional[str] = None, retry_after: Optional[int] = None) -> None:
+    st = load_rate_limit_state()
+    st[f"{key}_until"] = float(until_ts)
+    st[f"{key}_ts"] = int(time.time())
+    if path is not None:
+        st[f"{key}_path"] = path
+    if retry_after is not None:
+        st[f"{key}_retry_after"] = int(retry_after)
+    save_rate_limit_state(st)
+
+def get_rate_limit_until(key: str) -> float:
+    st = load_rate_limit_state()
+    try:
+        return float(st.get(f"{key}_until") or 0)
+    except Exception:
+        return 0.0
 def tokens_exist() -> bool:
     return os.path.exists(TOKENS_PATH)
 
@@ -1410,8 +1438,22 @@ def main() -> None:
 
     loop = 0
 
+    # Persisted rate-limit cooldowns (survive restarts)
+    global_rl_until = get_rate_limit_until("global")
+    presence_rl_until = get_rate_limit_until("presence")
+    open_window_rl_until = get_rate_limit_until("open_window")
+    last_rl_log: Dict[str, float] = {"global": 0.0, "presence": 0.0, "open_window": 0.0}
+
     while True:
         loop += 1
+        now0 = time.time()
+        if global_rl_until and now0 < global_rl_until:
+            sleep_s = int(min(global_rl_until - now0, backoff_max))
+            if now0 - last_rl_log.get("global", 0.0) > 30:
+                log(f"WARN: rate-limit cooldown active (global) -> sleep {sleep_s}s")
+                last_rl_log["global"] = now0
+            time.sleep(max(1, sleep_s))
+            continue
         try:
             if not tokens_exist():
                 log(f"waiting for tokens: {TOKENS_PATH} (login first)")
@@ -1429,71 +1471,96 @@ def main() -> None:
             for home_id in home_ids:
                 devices_polled = False
                 now_t = time.time()
+                devices = presence_devices_cache.get(home_id, [])
                 if (home_id not in presence_devices_cache) or (now_t - presence_last_poll.get(home_id, 0) >= presence_poll_seconds):
-                    devices_raw = get_mobile_devices(access_token, home_id)
-                    devices = [normalize_presence(d) for d in devices_raw]
-                    presence_devices_cache[home_id] = devices
-                    presence_last_poll[home_id] = now_t
-                    devices_polled = True
-                    # persist for 429/backoff republish
-                    try:
-                        cache = read_json(LAST_DEVICES_PATH)
-                        if not isinstance(cache, dict):
-                            cache = {}
-                        cache[str(home_id)] = {"ts": int(now_t), "devices": devices}
-                        write_json_atomic(LAST_DEVICES_PATH, cache)
-                    except Exception:
-                        pass
-                else:
-                    devices = presence_devices_cache.get(home_id, [])
-
-                if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
-                    publish_discovery_for_devices(
-                        mpub,
-                        discovery_prefix,
-                        topic_prefix,
-                        ha_device_name,
-                        ha_device_id,
-                        home_id,
-                        devices,
-                        enable_raw_sensors,
-                    )
-
-                publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
-                log(f"presence updated home={home_id} devices={len(devices)}")
-
-                # Presence Auto-Assist (HOME/AWAY) is independent from Open-Window.
-                # Run it only when we actually polled /mobileDevices (to reduce API load).
-                try:
-                    st_local = read_auto_assist_runtime()
-                    if st_local.get("enabled") is True and devices_polled:
-                        changed = False
+                    # Respect persisted presence rate-limit cooldown
+                    if presence_rl_until and now_t < presence_rl_until:
+                        if now_t - last_rl_log.get("presence", 0.0) > 60:
+                            log(f"WARN: presence cooldown active -> skip /mobileDevices for {int(presence_rl_until - now_t)}s")
+                            last_rl_log["presence"] = now_t
+                    else:
                         try:
-                            desired_presence = compute_desired_home_presence(devices)
-                            current_presence = get_home_presence(access_token, home_id)
-                            st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
-                            st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
-                            st_local["last_run"] = now_iso()
-                            if desired_presence in ("HOME", "AWAY"):
-                                if current_presence != desired_presence:
-                                    set_presence_lock(access_token, home_id, desired_presence)
-                                    st_local["presence_current"] = desired_presence
-                                    st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
-                                    st_local["last_error"] = None
-                                else:
-                                    st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
-                                    st_local["last_error"] = None
-                            else:
-                                st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
+                            devices_raw = get_mobile_devices(access_token, home_id)
+                            devices = [normalize_presence(d) for d in devices_raw]
+                            presence_devices_cache[home_id] = devices
+                            presence_last_poll[home_id] = now_t
+                            devices_polled = True
+                            # persist for 429/backoff republish
+                            try:
+                                cache = read_json(LAST_DEVICES_PATH)
+                                if not isinstance(cache, dict):
+                                    cache = {}
+                                cache[str(home_id)] = {"ts": int(now_t), "devices": devices}
+                                write_json_atomic(LAST_DEVICES_PATH, cache)
+                            except Exception:
+                                pass
+                        except RateLimitError as e:
+                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                            sleep_s = max(5, int(sleep_s))
+                            sleep_s = min(sleep_s, backoff_max)
+                            log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
+                            presence_rl_until = time.time() + sleep_s
+                            set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
+                            republish_from_cache(mpub, cfg)
                         except Exception as e:
-                            st_local["last_action"] = f"presence_error:home{home_id}"
-                            st_local["last_error"] = str(e)
-                            changed = True
-                        if changed:
-                            write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
-                            publish_auto_assist(mpub, cfg, st_local)
-                except Exception:
-                    pass
+                            log(f"WARN: presence poll failed: {e}")
+
+                        if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
+                            publish_discovery_for_devices(
+                                mpub,
+                                discovery_prefix,
+                                topic_prefix,
+                                ha_device_name,
+                                ha_device_id,
+                                home_id,
+                                devices,
+                                enable_raw_sensors,
+                            )
+
+                        publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
+                        log(f"presence updated home={home_id} devices={len(devices)}")
+
+                        # Presence Auto-Assist (HOME/AWAY) is independent from Open-Window.
+                        # Run it only when we actually polled /mobileDevices (to reduce API load).
+                        try:
+                            st_local = read_auto_assist_runtime()
+                            if st_local.get("enabled") is True and devices_polled:
+                                changed = False
+                                try:
+                                    desired_presence = compute_desired_home_presence(devices)
+                                    current_presence = get_home_presence(access_token, home_id)
+                                    st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
+                                    st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
+                                    st_local["last_run"] = now_iso()
+                                    if desired_presence in ("HOME", "AWAY"):
+                                        if current_presence != desired_presence:
+                                            set_presence_lock(access_token, home_id, desired_presence)
+                                            st_local["presence_current"] = desired_presence
+                                            st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
+                                            st_local["last_error"] = None
+                                        else:
+                                            st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
+                                            st_local["last_error"] = None
+                                    else:
+                                        st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
+                                except Exception as e:
+                                    st_local["last_action"] = f"presence_error:home{home_id}"
+                                    st_local["last_error"] = str(e)
+                                    changed = True
+                                if changed:
+                                    write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
+                                    publish_auto_assist(mpub, cfg, st_local)
+                        except Exception:
+                            pass
+                        except RateLimitError as e:
+                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                            sleep_s = max(5, int(sleep_s))
+                            sleep_s = min(sleep_s, backoff_max)
+                            log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
+                            presence_rl_until = time.time() + sleep_s
+                            set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
+                            republish_from_cache(mpub, cfg)
+
 
 
                 # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
@@ -1501,100 +1568,114 @@ def main() -> None:
                     now_t = time.time()
                     if now_t - open_window_last_poll.get(home_id, 0) >= open_window_poll_seconds:
                         open_window_last_poll[home_id] = now_t
+                        # Respect persisted open-window rate-limit cooldown
+                        if open_window_rl_until and now_t < open_window_rl_until:
+                            if now_t - last_rl_log.get("open_window", 0.0) > 60:
+                                log(f"WARN: open-window cooldown active -> skip for {int(open_window_rl_until - now_t)}s")
+                                last_rl_log["open_window"] = now_t
+                        else:
+                            try:
 
-                        # refresh zones list occasionally
-                        if now_t - zones_last_refresh.get(home_id, 0) >= zones_refresh_seconds:
-                            zones_cache[home_id] = get_zones(access_token, home_id)
-                            zones_last_refresh[home_id] = now_t
+                                # refresh zones list occasionally
+                                if now_t - zones_last_refresh.get(home_id, 0) >= zones_refresh_seconds:
+                                    zones_cache[home_id] = get_zones(access_token, home_id)
+                                    zones_last_refresh[home_id] = now_t
 
-                        zones = zones_cache.get(home_id, [])
-                        if isinstance(zones, list) and zones:
-                            if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
-                                publish_open_window_discovery(mpub, cfg, home_id, zones)
+                                zones = zones_cache.get(home_id, [])
+                                if isinstance(zones, list) and zones:
+                                    if loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0:
+                                        publish_open_window_discovery(mpub, cfg, home_id, zones)
 
-                            check_zone_ids: List[int] = []
-                            for z in zones:
-                                if not isinstance(z, dict):
-                                    continue
-                                zid = z.get("id")
-                                try:
-                                    zid_int = int(zid)
-                                except Exception:
-                                    continue
-                                owd = z.get("openWindowDetection")
-                                supported = True
-                                enabled = True
-                                if isinstance(owd, dict):
-                                    if "supported" in owd:
-                                        supported = bool(owd.get("supported"))
-                                    if "enabled" in owd:
-                                        enabled = bool(owd.get("enabled"))
-                                if supported and enabled:
-                                    check_zone_ids.append(zid_int)
+                                    check_zone_ids: List[int] = []
+                                    for z in zones:
+                                        if not isinstance(z, dict):
+                                            continue
+                                        zid = z.get("id")
+                                        try:
+                                            zid_int = int(zid)
+                                        except Exception:
+                                            continue
+                                        owd = z.get("openWindowDetection")
+                                        supported = True
+                                        enabled = True
+                                        if isinstance(owd, dict):
+                                            if "supported" in owd:
+                                                supported = bool(owd.get("supported"))
+                                            if "enabled" in owd:
+                                                enabled = bool(owd.get("enabled"))
+                                        if supported and enabled:
+                                            check_zone_ids.append(zid_int)
 
-                            zone_states: List[Tuple[int, Dict[str, Any]]] = []
-                            for zid in check_zone_ids:
-                                zstate = get_zone_state(access_token, home_id, zid)
-                                zone_states.append((zid, zstate))
+                                    zone_states: List[Tuple[int, Dict[str, Any]]] = []
+                                    for zid in check_zone_ids:
+                                        zstate = get_zone_state(access_token, home_id, zid)
+                                        zone_states.append((zid, zstate))
 
-                            publish_open_window_states(mpub, cfg, home_id, zone_states)
+                                    publish_open_window_states(mpub, cfg, home_id, zone_states)
 
-                            # Auto-Assist actions
-                            st_local = read_auto_assist_runtime()
-                            if st_local.get("enabled") is True:
-                                changed = False
-                                now_epoch = int(time.time())
+                                    # Auto-Assist actions
+                                    st_local = read_auto_assist_runtime()
+                                    if st_local.get("enabled") is True:
+                                        changed = False
+                                        now_epoch = int(time.time())
 
-                                                                # Open-Window Auto-Assist (timed like tado app: off_minutes + followup_minutes)
-                                ow = read_open_window_settings()
-                                off_min = int(ow.get('off_minutes', DEFAULT_OPEN_WINDOW_OFF_MINUTES))
-                                follow_min = int(ow.get('followup_minutes', DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES))
-                                off_sec = max(0, off_min) * 60
-                                follow_sec = max(0, follow_min) * 60
-                                reactivate_every = max(180, min(900, off_sec // 2 if off_sec else 300))
+                                                                        # Open-Window Auto-Assist (timed like tado app: off_minutes + followup_minutes)
+                                        ow = read_open_window_settings()
+                                        off_min = int(ow.get('off_minutes', DEFAULT_OPEN_WINDOW_OFF_MINUTES))
+                                        follow_min = int(ow.get('followup_minutes', DEFAULT_OPEN_WINDOW_FOLLOWUP_MINUTES))
+                                        off_sec = max(0, off_min) * 60
+                                        follow_sec = max(0, follow_min) * 60
+                                        reactivate_every = max(180, min(900, off_sec // 2 if off_sec else 300))
 
-                                for zid, zstate in zone_states:
-                                    detected = zone_open_window_detected(zstate)
-                                    key = (home_id, zid)
-                                    rt = open_window_runtime.get(key)
-                                    try:
-                                        if detected:
-                                            if rt is None:
-                                                rt = {'first_open': now_epoch, 'target_end': now_epoch + off_sec, 'closed_since': None, 'last_activate': 0}
-                                                open_window_runtime[key] = rt
-                                            else:
-                                                rt['closed_since'] = None
-                                                rt['target_end'] = max(int(rt.get('target_end', now_epoch)), now_epoch + off_sec)
-                                            # Activate (and occasionally re-activate) Open Window mode to ensure heating stays off while window is open
-                                            if now_epoch - int(rt.get('last_activate', 0)) >= reactivate_every:
-                                                activate_open_window(access_token, home_id, zid)
-                                                rt['last_activate'] = now_epoch
-                                                st_local['last_action'] = f"open_window_activate:home{home_id}_zone{zid}"
+                                        for zid, zstate in zone_states:
+                                            detected = zone_open_window_detected(zstate)
+                                            key = (home_id, zid)
+                                            rt = open_window_runtime.get(key)
+                                            try:
+                                                if detected:
+                                                    if rt is None:
+                                                        rt = {'first_open': now_epoch, 'target_end': now_epoch + off_sec, 'closed_since': None, 'last_activate': 0}
+                                                        open_window_runtime[key] = rt
+                                                    else:
+                                                        rt['closed_since'] = None
+                                                        rt['target_end'] = max(int(rt.get('target_end', now_epoch)), now_epoch + off_sec)
+                                                    # Activate (and occasionally re-activate) Open Window mode to ensure heating stays off while window is open
+                                                    if now_epoch - int(rt.get('last_activate', 0)) >= reactivate_every:
+                                                        activate_open_window(access_token, home_id, zid)
+                                                        rt['last_activate'] = now_epoch
+                                                        st_local['last_action'] = f"open_window_activate:home{home_id}_zone{zid}"
+                                                        st_local['last_run'] = now_iso()
+                                                        st_local['last_error'] = None
+                                                        changed = True
+                                                else:
+                                                    if rt is not None:
+                                                        if rt.get('closed_since') is None:
+                                                            rt['closed_since'] = now_epoch
+                                                        end_time = max(int(rt.get('target_end', now_epoch)), int(rt.get('closed_since', now_epoch)) + follow_sec)
+                                                        # Only cancel when window is closed AND timers are satisfied
+                                                        if now_epoch >= end_time:
+                                                            cancel_open_window(access_token, home_id, zid)
+                                                            open_window_runtime.pop(key, None)
+                                                            st_local['last_action'] = f"open_window_cancel:home{home_id}_zone{zid}"
+                                                            st_local['last_run'] = now_iso()
+                                                            st_local['last_error'] = None
+                                                            changed = True
+                                            except Exception as e:
                                                 st_local['last_run'] = now_iso()
-                                                st_local['last_error'] = None
+                                                st_local['last_action'] = f"open_window_error:home{home_id}_zone{zid}"
+                                                st_local['last_error'] = str(e)
                                                 changed = True
-                                        else:
-                                            if rt is not None:
-                                                if rt.get('closed_since') is None:
-                                                    rt['closed_since'] = now_epoch
-                                                end_time = max(int(rt.get('target_end', now_epoch)), int(rt.get('closed_since', now_epoch)) + follow_sec)
-                                                # Only cancel when window is closed AND timers are satisfied
-                                                if now_epoch >= end_time:
-                                                    cancel_open_window(access_token, home_id, zid)
-                                                    open_window_runtime.pop(key, None)
-                                                    st_local['last_action'] = f"open_window_cancel:home{home_id}_zone{zid}"
-                                                    st_local['last_run'] = now_iso()
-                                                    st_local['last_error'] = None
-                                                    changed = True
-                                    except Exception as e:
-                                        st_local['last_run'] = now_iso()
-                                        st_local['last_action'] = f"open_window_error:home{home_id}_zone{zid}"
-                                        st_local['last_error'] = str(e)
-                                        changed = True
-                                if changed:
-                                    write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
-                                    publish_auto_assist(mpub, cfg, st_local)
+                                        if changed:
+                                            write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
+                                            publish_auto_assist(mpub, cfg, st_local)
 
+                            except RateLimitError as e:
+                                sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                                sleep_s = max(5, int(sleep_s))
+                                sleep_s = min(sleep_s, backoff_max)
+                                log(f"WARN: Tado rate limit (429) on {e.path} -> open-window backoff {sleep_s}s")
+                                open_window_rl_until = time.time() + sleep_s
+                                set_rate_limit_until("open_window", open_window_rl_until, path=e.path, retry_after=e.retry_after)
             # Auto-Assist heartbeat metadata when enabled (real actions come next)
             st = read_auto_assist_runtime()
             if st.get("enabled") is True:
@@ -1612,6 +1693,9 @@ def main() -> None:
             sleep_s = max(5, int(sleep_s))
             sleep_s = min(sleep_s, backoff_max)
             log(f"WARN: Tado rate limit (429) on {e.path} -> backoff {sleep_s}s")
+
+            global_rl_until = time.time() + sleep_s
+            set_rate_limit_until("global", global_rl_until, path=e.path, retry_after=e.retry_after)
 
             republish_from_cache(mpub, cfg)
 
