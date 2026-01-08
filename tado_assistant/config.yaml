@@ -1,5 +1,5 @@
 name: "Tado Assistant (Ingress)"
-version: "1.0.3"
+version: "1.0.4"
 slug: tado_assistant
 description: "Tado Assistant"
 
@@ -41,7 +41,12 @@ gpio: false
 
 # Optionen (werden nach /data/options.json gemountet)
 options:
-  poll_seconds: 30
+  poll_seconds: 300
+  presence_poll_seconds: 900
+  enable_raw_sensors: true
+  enable_open_window: true
+  open_window_poll_seconds: 120
+  zones_refresh_seconds: 21600
   mqtt_enabled: false
   mqtt_host: ""
   mqtt_port: 1883
@@ -52,6 +57,11 @@ options:
 
 schema:
   poll_seconds: int(5,3600)
+  presence_poll_seconds: int(30,86400)
+  enable_raw_sensors: bool
+  enable_open_window: bool
+  open_window_poll_seconds: int(30,3600)
+  zones_refresh_seconds: int(300,86400)
   mqtt_enabled: bool
   mqtt_host: str?
   mqtt_port: int(1,65535)
