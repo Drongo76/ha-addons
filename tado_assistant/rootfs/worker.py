@@ -35,11 +35,12 @@ TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 HTTP_TIMEOUT = 20
 DEFAULT_POLL_SECONDS = 300
-MIN_POLL_SECONDS = 10  # sanity: prevent 0/negative; allow user-configured polling
+DEFAULT_PRESENCE_POLL_SECONDS = 900  # /mobileDevices poll interval (separate from poll_seconds)
+MIN_POLL_SECONDS = 5  # allow user-configured poll_seconds; minimal sanity clamp
 DEFAULT_OPEN_WINDOW_POLL_SECONDS = 900
-MIN_OPEN_WINDOW_POLL_SECONDS = 300
+MIN_OPEN_WINDOW_POLL_SECONDS = 30
 DEFAULT_ZONES_REFRESH_SECONDS = 21600  # 6h
-MIN_ZONES_REFRESH_SECONDS = 3600
+MIN_ZONES_REFRESH_SECONDS = 300
 
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
@@ -136,15 +137,13 @@ def load_config() -> Dict[str, Any]:
         poll = DEFAULT_POLL_SECONDS
     poll = max(MIN_POLL_SECONDS, poll)
 
-    # Presence polling (mobileDevices) can be heavier; allow separate interval.
-    presence_poll = opt.get("presence_poll_seconds", poll)
-    if presence_poll in ("", None):
-        presence_poll = poll
+    presence_poll_seconds = opt.get("presence_poll_seconds", max(poll * 3, DEFAULT_PRESENCE_POLL_SECONDS))
     try:
-        presence_poll = int(presence_poll)
+        presence_poll_seconds = int(presence_poll_seconds)
     except Exception:
-        presence_poll = poll
-    presence_poll = max(MIN_POLL_SECONDS, presence_poll)
+        presence_poll_seconds = max(poll * 3, DEFAULT_PRESENCE_POLL_SECONDS)
+    presence_poll_seconds = max(30, presence_poll_seconds)
+
 
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
     enable_raw_sensors = bool(enable_raw_sensors)
@@ -236,7 +235,7 @@ def load_config() -> Dict[str, Any]:
 
     return {
         "poll_seconds": poll,
-        "presence_poll_seconds": presence_poll,
+        "presence_poll_seconds": presence_poll_seconds,
         "enable_raw_sensors": enable_raw_sensors,
         "enable_open_window": enable_open_window,
         "open_window_poll_seconds": open_window_poll_seconds,
@@ -1071,6 +1070,15 @@ def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
     write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
 
 
+def _load_open_window_discovery_state() -> Dict[str, Any]:
+    st = read_json(OPEN_WINDOW_DISCOVERY_STATE_PATH)
+    if isinstance(st, dict):
+        return st
+    return {"homes": {}}
+
+
+def _save_open_window_discovery_state(st: Dict[str, Any]) -> None:
+    write_json_atomic(OPEN_WINDOW_DISCOVERY_STATE_PATH, st)
 
 
 def publish_open_window_discovery(
@@ -1200,7 +1208,7 @@ def publish_presence(
 
     if enable_raw_sensors:
         agg_topic = f"{topic_prefix}/presence/home_{home_id}/raw"
-        # Overall home presence state: home if any device is home, not_home if all are not_home, else unknown
+                # Overall home presence state: home if any device is home, not_home if all are not_home, else unknown
         states = [str(d.get("state", "unknown")) for d in devices if isinstance(d, dict)]
         if any(s == "home" for s in states):
             home_state = "home"
@@ -1267,9 +1275,8 @@ def main() -> None:
     cfg = load_config()
 
     poll = int(cfg["poll_seconds"])
-    presence_poll = int(cfg.get("presence_poll_seconds", poll))
-    if presence_poll < 10:
-        presence_poll = 10
+    presence_poll_seconds = int(cfg.get("presence_poll_seconds", max(poll * 3, DEFAULT_PRESENCE_POLL_SECONDS)))
+    presence_poll_seconds = max(30, presence_poll_seconds)
     # Open-window polling can be more expensive (multiple zone state calls).
     # Use a dedicated interval and default to a slower cadence to avoid 429s.
     try:
@@ -1290,13 +1297,17 @@ def main() -> None:
     zones_last_refresh: Dict[int, float] = {}
     open_window_last_poll: Dict[int, float] = {}
     open_window_runtime: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    # Presence runtime caches (/mobileDevices)
+    presence_last_poll: Dict[int, float] = {}
+    presence_devices_cache: Dict[int, List[Dict[str, Any]]] = {}
     topic_prefix = cfg["topic_prefix"]
     discovery_prefix = cfg["discovery_prefix"]
     ha_device_name = cfg["ha_device_name"]
     ha_device_id = cfg["ha_device_id"]
     enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
 
-    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll} enable_raw_sensors={enable_raw_sensors}")
+    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll_seconds} enable_raw_sensors={enable_raw_sensors}")
 
     # Force OFF after every restart (your requirement)
     boot_auto_assist_force_off()
@@ -1398,7 +1409,6 @@ def main() -> None:
     backoff_current = backoff_base
 
     loop = 0
-    last_presence_poll_by_home: Dict[int, float] = {}
 
     while True:
         loop += 1
@@ -1417,23 +1427,25 @@ def main() -> None:
                 log(f"home ids resolved: {home_ids}")
 
             for home_id in home_ids:
-                now_ts = time.time()
-                last_ts = last_presence_poll_by_home.get(home_id, 0.0)
-                if (now_ts - last_ts) < float(presence_poll):
-                    # Skip /mobileDevices this cycle to reduce API pressure.
-                    continue
-                devices_raw = get_mobile_devices(access_token, home_id)
-                devices = [normalize_presence(d) for d in devices_raw]
-                last_presence_poll_by_home[home_id] = now_ts
-                # Persist last known devices for republish on rate-limit backoff.
-                try:
-                    cache = read_json(LAST_DEVICES_PATH)
-                    if not isinstance(cache, dict):
-                        cache = {}
-                    cache[str(home_id)] = {"_ts": now_iso(), "devices": devices}
-                    write_json_atomic(LAST_DEVICES_PATH, cache)
-                except Exception:
-                    pass
+                devices_polled = False
+                now_t = time.time()
+                if (home_id not in presence_devices_cache) or (now_t - presence_last_poll.get(home_id, 0) >= presence_poll_seconds):
+                    devices_raw = get_mobile_devices(access_token, home_id)
+                    devices = [normalize_presence(d) for d in devices_raw]
+                    presence_devices_cache[home_id] = devices
+                    presence_last_poll[home_id] = now_t
+                    devices_polled = True
+                    # persist for 429/backoff republish
+                    try:
+                        cache = read_json(LAST_DEVICES_PATH)
+                        if not isinstance(cache, dict):
+                            cache = {}
+                        cache[str(home_id)] = {"ts": int(now_t), "devices": devices}
+                        write_json_atomic(LAST_DEVICES_PATH, cache)
+                    except Exception:
+                        pass
+                else:
+                    devices = presence_devices_cache.get(home_id, [])
 
                 if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
                     publish_discovery_for_devices(
@@ -1449,45 +1461,39 @@ def main() -> None:
 
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
                 log(f"presence updated home={home_id} devices={len(devices)}")
-                # Auto-Assist actions (Presence: HOME/AWAY)
-                st_local = read_auto_assist_runtime()
-                if st_local.get("enabled") is True:
-                    changed = False
-                    # --- Presence Auto-Assist (HOME/AWAY) ---
-                    try:
-                        desired_presence = compute_desired_home_presence(devices)
-                        current_presence = get_home_presence(access_token, home_id)
 
-                        st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
-                        st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
-                        st_local["last_run"] = now_iso()
-
-                        if desired_presence in ("HOME", "AWAY"):
-                            if current_presence != desired_presence:
-                                set_presence_lock(access_token, home_id, desired_presence)
-                                current_presence = desired_presence
-                                st_local["presence_current"] = desired_presence
-                                st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
-                                st_local["last_error"] = None
-                            else:
-                                st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
-                                st_local["last_error"] = None
-                        else:
-                            st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
-                            st_local["last_error"] = None
-
-                        changed = True
-                    except Exception as e:
-                        st_local["last_run"] = now_iso()
-                        st_local["last_action"] = f"presence_error:home{home_id}"
-                        st_local["last_error"] = str(e)
-                        changed = True
-
-                    if changed:
-                        write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
-                        publish_auto_assist(mpub, cfg, st_local)
+                # Presence Auto-Assist (HOME/AWAY) is independent from Open-Window.
+                # Run it only when we actually polled /mobileDevices (to reduce API load).
+                try:
+                    st_local = read_auto_assist_runtime()
+                    if st_local.get("enabled") is True and devices_polled:
                         changed = False
-
+                        try:
+                            desired_presence = compute_desired_home_presence(devices)
+                            current_presence = get_home_presence(access_token, home_id)
+                            st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
+                            st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
+                            st_local["last_run"] = now_iso()
+                            if desired_presence in ("HOME", "AWAY"):
+                                if current_presence != desired_presence:
+                                    set_presence_lock(access_token, home_id, desired_presence)
+                                    st_local["presence_current"] = desired_presence
+                                    st_local["last_action"] = f"presence_set_{desired_presence.lower()}:home{home_id}"
+                                    st_local["last_error"] = None
+                                else:
+                                    st_local["last_action"] = f"presence_ok_{desired_presence.lower()}:home{home_id}"
+                                    st_local["last_error"] = None
+                            else:
+                                st_local["last_action"] = f"presence_skip_unknown:home{home_id}"
+                        except Exception as e:
+                            st_local["last_action"] = f"presence_error:home{home_id}"
+                            st_local["last_error"] = str(e)
+                            changed = True
+                        if changed:
+                            write_json_atomic(AUTO_ASSIST_STATE_PATH, st_local)
+                            publish_auto_assist(mpub, cfg, st_local)
+                except Exception:
+                    pass
 
 
                 # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
