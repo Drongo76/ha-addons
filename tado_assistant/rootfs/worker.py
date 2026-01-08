@@ -35,9 +35,9 @@ TADO_CLIENT_ID = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 HTTP_TIMEOUT = 20
 DEFAULT_POLL_SECONDS = 300
-MIN_POLL_SECONDS = 10  # minimal sanity clamp (allow user to set e.g. 300)
+MIN_POLL_SECONDS = 10  # sanity: prevent 0/negative; allow user-configured polling
 DEFAULT_OPEN_WINDOW_POLL_SECONDS = 900
-MIN_OPEN_WINDOW_POLL_SECONDS = 10  # minimal sanity clamp
+MIN_OPEN_WINDOW_POLL_SECONDS = 300
 DEFAULT_ZONES_REFRESH_SECONDS = 21600  # 6h
 MIN_ZONES_REFRESH_SECONDS = 3600
 
@@ -136,6 +136,16 @@ def load_config() -> Dict[str, Any]:
         poll = DEFAULT_POLL_SECONDS
     poll = max(MIN_POLL_SECONDS, poll)
 
+    # Presence polling (mobileDevices) can be heavier; allow separate interval.
+    presence_poll = opt.get("presence_poll_seconds", poll)
+    if presence_poll in ("", None):
+        presence_poll = poll
+    try:
+        presence_poll = int(presence_poll)
+    except Exception:
+        presence_poll = poll
+    presence_poll = max(MIN_POLL_SECONDS, presence_poll)
+
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
     enable_raw_sensors = bool(enable_raw_sensors)
 
@@ -226,6 +236,7 @@ def load_config() -> Dict[str, Any]:
 
     return {
         "poll_seconds": poll,
+        "presence_poll_seconds": presence_poll,
         "enable_raw_sensors": enable_raw_sensors,
         "enable_open_window": enable_open_window,
         "open_window_poll_seconds": open_window_poll_seconds,
@@ -1256,6 +1267,9 @@ def main() -> None:
     cfg = load_config()
 
     poll = int(cfg["poll_seconds"])
+    presence_poll = int(cfg.get("presence_poll_seconds", poll))
+    if presence_poll < 10:
+        presence_poll = 10
     # Open-window polling can be more expensive (multiple zone state calls).
     # Use a dedicated interval and default to a slower cadence to avoid 429s.
     try:
@@ -1282,7 +1296,7 @@ def main() -> None:
     ha_device_id = cfg["ha_device_id"]
     enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
 
-    log(f"starting. poll_seconds={poll} enable_raw_sensors={enable_raw_sensors}")
+    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll} enable_raw_sensors={enable_raw_sensors}")
 
     # Force OFF after every restart (your requirement)
     boot_auto_assist_force_off()
@@ -1384,6 +1398,7 @@ def main() -> None:
     backoff_current = backoff_base
 
     loop = 0
+    last_presence_poll_by_home: Dict[int, float] = {}
 
     while True:
         loop += 1
@@ -1402,8 +1417,23 @@ def main() -> None:
                 log(f"home ids resolved: {home_ids}")
 
             for home_id in home_ids:
+                now_ts = time.time()
+                last_ts = last_presence_poll_by_home.get(home_id, 0.0)
+                if (now_ts - last_ts) < float(presence_poll):
+                    # Skip /mobileDevices this cycle to reduce API pressure.
+                    continue
                 devices_raw = get_mobile_devices(access_token, home_id)
                 devices = [normalize_presence(d) for d in devices_raw]
+                last_presence_poll_by_home[home_id] = now_ts
+                # Persist last known devices for republish on rate-limit backoff.
+                try:
+                    cache = read_json(LAST_DEVICES_PATH)
+                    if not isinstance(cache, dict):
+                        cache = {}
+                    cache[str(home_id)] = {"_ts": now_iso(), "devices": devices}
+                    write_json_atomic(LAST_DEVICES_PATH, cache)
+                except Exception:
+                    pass
 
                 if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
                     publish_discovery_for_devices(
