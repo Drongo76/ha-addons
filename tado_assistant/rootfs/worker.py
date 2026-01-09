@@ -1532,6 +1532,7 @@ def main() -> None:
                                     st_local["presence_desired"] = desired_presence if desired_presence else "UNKNOWN"
                                     st_local["presence_current"] = current_presence if current_presence else "UNKNOWN"
                                     st_local["last_run"] = now_iso()
+                                    changed = True
                                     if desired_presence in ("HOME", "AWAY"):
                                         if current_presence != desired_presence:
                                             set_presence_lock(access_token, home_id, desired_presence)
