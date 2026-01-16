@@ -41,7 +41,7 @@ MIN_POLL_SECONDS = 5  # allow user-configured poll_seconds; minimal sanity clamp
 DEFAULT_OPEN_WINDOW_POLL_SECONDS = 900
 MIN_OPEN_WINDOW_POLL_SECONDS = 30
 DEFAULT_ZONES_REFRESH_SECONDS = 21600  # 6h
-MIN_ZONES_REFRESH_SECONDS = 300
+MIN_ZONES_REFRESH_SECONDS = 3600
 
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
@@ -1436,6 +1436,10 @@ def main() -> None:
     backoff_max = int(cfg["rate_limit_backoff_max_seconds"])
     backoff_current = backoff_base
 
+
+    # Per-endpoint exponential backoff (so 429s don\'t repeat forever)
+    presence_backoff_current = backoff_base
+    open_window_backoff_current = backoff_base
     loop = 0
 
     # Persisted rate-limit cooldowns (survive restarts)
@@ -1485,6 +1489,7 @@ def main() -> None:
                             presence_devices_cache[home_id] = devices
                             presence_last_poll[home_id] = now_t
                             devices_polled = True
+                            presence_backoff_current = backoff_base
                             # persist for 429/backoff republish
                             try:
                                 cache = read_json(LAST_DEVICES_PATH)
@@ -1495,10 +1500,11 @@ def main() -> None:
                             except Exception:
                                 pass
                         except RateLimitError as e:
-                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                            sleep_s = e.retry_after if e.retry_after is not None else presence_backoff_current
                             sleep_s = max(5, int(sleep_s))
                             sleep_s = min(sleep_s, backoff_max)
                             log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
+                            presence_backoff_current = min(max(presence_backoff_current * 2, backoff_base), backoff_max)
                             presence_rl_until = time.time() + sleep_s
                             set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
                             republish_from_cache(mpub, cfg)
@@ -1553,14 +1559,6 @@ def main() -> None:
                                     publish_auto_assist(mpub, cfg, st_local)
                         except Exception:
                             pass
-                        except RateLimitError as e:
-                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
-                            sleep_s = max(5, int(sleep_s))
-                            sleep_s = min(sleep_s, backoff_max)
-                            log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
-                            presence_rl_until = time.time() + sleep_s
-                            set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
-                            republish_from_cache(mpub, cfg)
 
 
 
@@ -1613,6 +1611,10 @@ def main() -> None:
                                         zone_states.append((zid, zstate))
 
                                     publish_open_window_states(mpub, cfg, home_id, zone_states)
+                                    open_window_backoff_current = backoff_base
+                                    open_window_backoff_current = backoff_base
+
+                                    open_window_backoff_current = backoff_base
 
                                     # Auto-Assist actions
                                     st_local = read_auto_assist_runtime()
@@ -1671,10 +1673,11 @@ def main() -> None:
                                             publish_auto_assist(mpub, cfg, st_local)
 
                             except RateLimitError as e:
-                                sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                                sleep_s = e.retry_after if e.retry_after is not None else open_window_backoff_current
                                 sleep_s = max(5, int(sleep_s))
                                 sleep_s = min(sleep_s, backoff_max)
                                 log(f"WARN: Tado rate limit (429) on {e.path} -> open-window backoff {sleep_s}s")
+                                open_window_backoff_current = min(max(open_window_backoff_current * 2, backoff_base), backoff_max)
                                 open_window_rl_until = time.time() + sleep_s
                                 set_rate_limit_until("open_window", open_window_rl_until, path=e.path, retry_after=e.retry_after)
             # Auto-Assist heartbeat metadata when enabled (real actions come next)
