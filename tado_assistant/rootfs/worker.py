@@ -41,7 +41,7 @@ MIN_POLL_SECONDS = 5  # allow user-configured poll_seconds; minimal sanity clamp
 DEFAULT_OPEN_WINDOW_POLL_SECONDS = 900
 MIN_OPEN_WINDOW_POLL_SECONDS = 30
 DEFAULT_ZONES_REFRESH_SECONDS = 21600  # 6h
-MIN_ZONES_REFRESH_SECONDS = 3600
+MIN_ZONES_REFRESH_SECONDS = 300
 
 DISCOVERY_REPUBLISH_EVERY_LOOPS = 20
 
@@ -1436,10 +1436,6 @@ def main() -> None:
     backoff_max = int(cfg["rate_limit_backoff_max_seconds"])
     backoff_current = backoff_base
 
-
-    # Per-endpoint exponential backoff (so 429s don\'t repeat forever)
-    presence_backoff_current = backoff_base
-    open_window_backoff_current = backoff_base
     loop = 0
 
     # Persisted rate-limit cooldowns (survive restarts)
@@ -1474,9 +1470,10 @@ def main() -> None:
 
             for home_id in home_ids:
                 devices_polled = False
+                presence_rate_limited = False
                 now_t = time.time()
                 devices = presence_devices_cache.get(home_id, [])
-                if (home_id not in presence_devices_cache) or (now_t - presence_last_poll.get(home_id, 0) >= presence_poll_seconds):
+                if now_t - presence_last_poll.get(home_id, now_t) >= presence_poll_seconds:
                     # Respect persisted presence rate-limit cooldown
                     if presence_rl_until and now_t < presence_rl_until:
                         if now_t - last_rl_log.get("presence", 0.0) > 60:
@@ -1489,7 +1486,6 @@ def main() -> None:
                             presence_devices_cache[home_id] = devices
                             presence_last_poll[home_id] = now_t
                             devices_polled = True
-                            presence_backoff_current = backoff_base
                             # persist for 429/backoff republish
                             try:
                                 cache = read_json(LAST_DEVICES_PATH)
@@ -1500,31 +1496,46 @@ def main() -> None:
                             except Exception:
                                 pass
                         except RateLimitError as e:
-                            sleep_s = e.retry_after if e.retry_after is not None else presence_backoff_current
+                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
                             sleep_s = max(5, int(sleep_s))
                             sleep_s = min(sleep_s, backoff_max)
                             log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
-                            presence_backoff_current = min(max(presence_backoff_current * 2, backoff_base), backoff_max)
                             presence_rl_until = time.time() + sleep_s
                             set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
                             republish_from_cache(mpub, cfg)
+                            presence_rate_limited = True
+                            # Do NOT overwrite presence with an empty list when rate-limited.
+                            # Try to reuse last persisted devices from disk for publishing.
+                            try:
+                                cache = read_json(LAST_DEVICES_PATH)
+                                if isinstance(cache, dict):
+                                    entry = cache.get(str(home_id))
+                                    if isinstance(entry, dict) and isinstance(entry.get("devices"), list):
+                                        devices = entry.get("devices")
+                                        presence_devices_cache[home_id] = devices
+                            except Exception:
+                                pass
                         except Exception as e:
                             log(f"WARN: presence poll failed: {e}")
 
-                        if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
-                            publish_discovery_for_devices(
-                                mpub,
-                                discovery_prefix,
-                                topic_prefix,
-                                ha_device_name,
-                                ha_device_id,
-                                home_id,
-                                devices,
-                                enable_raw_sensors,
-                            )
+                        if (not presence_rate_limited) or (isinstance(devices, list) and len(devices) > 0):
 
-                        publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
-                        log(f"presence updated home={home_id} devices={len(devices)}")
+                            if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
+                                publish_discovery_for_devices(
+                                    mpub,
+                                    discovery_prefix,
+                                    topic_prefix,
+                                    ha_device_name,
+                                    ha_device_id,
+                                    home_id,
+                                    devices,
+                                    enable_raw_sensors,
+                                )
+
+                            publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
+                            log(f"presence updated home={home_id} devices={len(devices)}")
+                        else:
+                            log("presence skipped (rate-limited, no cached devices)")
 
                         # Presence Auto-Assist (HOME/AWAY) is independent from Open-Window.
                         # Run it only when we actually polled /mobileDevices (to reduce API load).
@@ -1559,13 +1570,21 @@ def main() -> None:
                                     publish_auto_assist(mpub, cfg, st_local)
                         except Exception:
                             pass
+                        except RateLimitError as e:
+                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                            sleep_s = max(5, int(sleep_s))
+                            sleep_s = min(sleep_s, backoff_max)
+                            log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
+                            presence_rl_until = time.time() + sleep_s
+                            set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
+                            republish_from_cache(mpub, cfg)
 
 
 
                 # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
                 if cfg.get("enable_open_window"):
                     now_t = time.time()
-                    if now_t - open_window_last_poll.get(home_id, 0) >= open_window_poll_seconds:
+                    if now_t - open_window_last_poll.get(home_id, now_t) >= open_window_poll_seconds:
                         open_window_last_poll[home_id] = now_t
                         # Respect persisted open-window rate-limit cooldown
                         if open_window_rl_until and now_t < open_window_rl_until:
@@ -1576,7 +1595,7 @@ def main() -> None:
                             try:
 
                                 # refresh zones list occasionally
-                                if now_t - zones_last_refresh.get(home_id, 0) >= zones_refresh_seconds:
+                                if now_t - zones_last_refresh.get(home_id, now_t) >= zones_refresh_seconds:
                                     zones_cache[home_id] = get_zones(access_token, home_id)
                                     zones_last_refresh[home_id] = now_t
 
@@ -1611,10 +1630,6 @@ def main() -> None:
                                         zone_states.append((zid, zstate))
 
                                     publish_open_window_states(mpub, cfg, home_id, zone_states)
-                                    open_window_backoff_current = backoff_base
-                                    open_window_backoff_current = backoff_base
-
-                                    open_window_backoff_current = backoff_base
 
                                     # Auto-Assist actions
                                     st_local = read_auto_assist_runtime()
@@ -1673,11 +1688,10 @@ def main() -> None:
                                             publish_auto_assist(mpub, cfg, st_local)
 
                             except RateLimitError as e:
-                                sleep_s = e.retry_after if e.retry_after is not None else open_window_backoff_current
+                                sleep_s = e.retry_after if e.retry_after is not None else backoff_current
                                 sleep_s = max(5, int(sleep_s))
                                 sleep_s = min(sleep_s, backoff_max)
                                 log(f"WARN: Tado rate limit (429) on {e.path} -> open-window backoff {sleep_s}s")
-                                open_window_backoff_current = min(max(open_window_backoff_current * 2, backoff_base), backoff_max)
                                 open_window_rl_until = time.time() + sleep_s
                                 set_rate_limit_until("open_window", open_window_rl_until, path=e.path, retry_after=e.retry_after)
             # Auto-Assist heartbeat metadata when enabled (real actions come next)
