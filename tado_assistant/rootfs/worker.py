@@ -1473,7 +1473,7 @@ def main() -> None:
                 presence_rate_limited = False
                 now_t = time.time()
                 devices = presence_devices_cache.get(home_id, [])
-                if now_t - presence_last_poll.get(home_id, now_t) >= presence_poll_seconds:
+                if now_t - presence_last_poll.get(home_id, 0.0) >= presence_poll_seconds:
                     # Respect persisted presence rate-limit cooldown
                     if presence_rl_until and now_t < presence_rl_until:
                         if now_t - last_rl_log.get("presence", 0.0) > 60:
@@ -1584,7 +1584,7 @@ def main() -> None:
                 # Open-Window (optional): publish sensors + (when Auto-Assist ON) trigger openWindow mode
                 if cfg.get("enable_open_window"):
                     now_t = time.time()
-                    if now_t - open_window_last_poll.get(home_id, now_t) >= open_window_poll_seconds:
+                    if now_t - open_window_last_poll.get(home_id, 0.0) >= open_window_poll_seconds:
                         open_window_last_poll[home_id] = now_t
                         # Respect persisted open-window rate-limit cooldown
                         if open_window_rl_until and now_t < open_window_rl_until:
