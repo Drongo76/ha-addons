@@ -493,11 +493,9 @@ def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
 # -----------------------------
 HA_CORE_PROXY_BASE = "http://supervisor/core/api"
 
-def ha_get_entity_state(entity_id: str) -> str:
-    """Read an entity state from Home Assistant via Supervisor proxy.
-    Requires `homeassistant_api: true` in the add-on config.yaml.
-    Uses SUPERVISOR_TOKEN injected by Supervisor.
-    Returns state string (e.g. 'home', 'not_home', 'unknown', ...).
+def ha_get_entity_json(entity_id: str) -> Dict[str, Any]:
+    """Fetch full entity JSON from Home Assistant via Supervisor proxy.
+    Requires `homeassistant_api: true` in the add-on config.yaml and SUPERVISOR_TOKEN env.
     """
     token = os.getenv("SUPERVISOR_TOKEN") or ""
     if not token:
@@ -509,7 +507,14 @@ def ha_get_entity_state(entity_id: str) -> str:
         if len(body) > 200:
             body = body[:200] + "…"
         raise RuntimeError(f"HA state read failed ({r.status_code}) for {entity_id}: {body}")
-    data = r.json() if r.headers.get("content-type","").lower().startswith("application/json") else {}
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+def ha_get_entity_state(entity_id: str) -> str:
+    """Return only the state string for an entity (e.g. 'home', 'not_home', ...)."""
+    data = ha_get_entity_json(entity_id)
     return str((data or {}).get("state") or "unknown")
 
 def ha_presence_as_devices(entity_id: str, state: str) -> List[Dict[str, Any]]:
@@ -1533,8 +1538,7 @@ def main() -> None:
                     else:
                         try:
                             if presence_source == "ha":
-                                ha_state = ha_get_entity_state(ha_presence_entity)
-                                devices = ha_presence_as_devices(ha_presence_entity, ha_state)
+                                devices = ha_presence_as_devices(ha_presence_entity)
                             else:
                                 devices_raw = get_mobile_devices(access_token, home_id)
                                 devices = [normalize_presence(d) for d in devices_raw]
