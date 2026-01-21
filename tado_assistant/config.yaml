@@ -1,5 +1,5 @@
 name: "Tado Assistant (Ingress)"
-version: "1.2.0"
+version: "1.2.1"
 slug: tado_assistant
 description: "Tado Assistant"
 
@@ -13,32 +13,21 @@ arch:
 startup: services
 boot: auto
 
-# verhindert docker --init (tini) => s6 bleibt PID1
+# WICHTIG: verhindert docker --init (tini) => s6 bleibt PID1
 init: false
 
-# erlaubt Zugriff auf Supervisor/Core API via http://supervisor/... und SUPERVISOR_TOKEN
+# Allow Home Assistant Core API access via Supervisor proxy:
+# http://supervisor/core/api/...
+homeassistant_api: true
+
+# (Optional) Supervisor API access (not required for core proxy, but useful later)
 hassio_api: true
-
-options:
-  poll_seconds: 300
-  presence_poll_seconds: 60
-  ha_presence_entity: "group.family"
-  enable_raw_sensors: true
-  enable_open_window: true
-  open_window_poll_seconds: 120
-  zones_refresh_seconds: 21600
-
-  mqtt_enabled: true
-  mqtt_host: "core-mosquitto"
-  mqtt_port: 1883
-  mqtt_username: null
-  mqtt_password: null
-  mqtt_topic_prefix: "tado_assistant"
-  mqtt_discovery_prefix: "homeassistant"
+hassio_role: default
 
 schema:
   poll_seconds: int(5,3600)
   presence_poll_seconds: int(30,86400)
+  presence_source: list(tado|ha)
   ha_presence_entity: str?
   enable_raw_sensors: bool
   enable_open_window: bool
@@ -51,3 +40,7 @@ schema:
   mqtt_password: password?
   mqtt_topic_prefix: str?
   mqtt_discovery_prefix: str?
+
+options:
+  presence_source: ha
+  ha_presence_entity: group.family
