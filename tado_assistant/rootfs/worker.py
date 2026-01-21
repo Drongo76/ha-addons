@@ -173,14 +173,20 @@ def load_config() -> Dict[str, Any]:
         presence_poll_seconds = max(poll * 3, DEFAULT_PRESENCE_POLL_SECONDS)
     presence_poll_seconds = max(30, presence_poll_seconds)
 
-    # Presence source:
-    # - "tado": poll tado /mobileDevices (legacy)
-    # - "ha":   read Home Assistant entity (e.g. group.family) via Supervisor Core API proxy
-    presence_source = str(opt.get("presence_source", "tado")).strip().lower()
+
+    presence_source = str(opt.get("presence_source", opt.get("presence_mode", "tado"))).strip().lower()
     if presence_source not in ("tado", "ha"):
         presence_source = "tado"
-    ha_presence_entity = str(opt.get("ha_presence_entity", "group.family")).strip() or "group.family"
 
+    ha_presence_entity = opt.get("ha_presence_entity", "group.family")
+    if not isinstance(ha_presence_entity, str) or not ha_presence_entity.strip():
+        ha_presence_entity = "group.family"
+    ha_presence_entity = ha_presence_entity.strip()
+
+    # Optional external fallback (not required if SUPERVISOR_TOKEN is available)
+    ha_url = opt.get("ha_url")
+    ha_token = opt.get("ha_token")
+    ha_verify_ssl = opt.get("ha_verify_ssl", True)
 
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
     enable_raw_sensors = bool(enable_raw_sensors)
@@ -275,6 +281,9 @@ def load_config() -> Dict[str, Any]:
         "presence_poll_seconds": presence_poll_seconds,
         "presence_source": presence_source,
         "ha_presence_entity": ha_presence_entity,
+        "ha_url": ha_url,
+        "ha_token": ha_token,
+        "ha_verify_ssl": ha_verify_ssl,
         "enable_raw_sensors": enable_raw_sensors,
         "enable_open_window": enable_open_window,
         "open_window_poll_seconds": open_window_poll_seconds,
@@ -488,81 +497,6 @@ def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
     if status != 200:
         raise RuntimeError(f"{path} failed status={status} data={data}")
     return data if isinstance(data, list) else []
-
-# -----------------------------
-# Home Assistant presence (GPS) via Supervisor Core API proxy
-# -----------------------------
-HA_CORE_PROXY_BASE = "http://supervisor/core/api"
-
-def ha_get_entity_json(entity_id: str) -> Dict[str, Any]:
-    """Fetch full entity JSON from Home Assistant via Supervisor proxy.
-    Requires `homeassistant_api: true` in the add-on config.yaml and SUPERVISOR_TOKEN env.
-    """
-    token = os.getenv("SUPERVISOR_TOKEN") or ""
-    if not token:
-        raise RuntimeError("SUPERVISOR_TOKEN missing (check add-on config.yaml: homeassistant_api: true)")
-    url = f"{HA_CORE_PROXY_BASE}/states/{entity_id}"
-    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-    if r.status_code != 200:
-        body = (r.text or "").strip()
-        if len(body) > 200:
-            body = body[:200] + "…"
-        raise RuntimeError(f"HA state read failed ({r.status_code}) for {entity_id}: {body}")
-    try:
-        return r.json()
-    except Exception:
-        return {}
-
-def ha_get_entity_state(entity_id: str) -> str:
-    """Return only the state string for an entity (e.g. 'home', 'not_home', ...)."""
-    data = ha_get_entity_json(entity_id)
-    return str((data or {}).get("state") or "unknown")
-
-def _stable_device_id(entity_id: str) -> int:
-    """Stable positive int for entity_id -> used as device_id in MQTT topics/unique_ids."""
-    return int(zlib.crc32(entity_id.encode("utf-8")) & 0x7FFFFFFF)
-
-def ha_presence_as_devices(group_entity_id: str) -> List[Dict[str, Any]]:
-    """
-    Expand a HA group (e.g. group.family) into a synthetic mobileDevices-like list.
-    This keeps MQTT discovery/publish logic unchanged (per-person device_tracker + raw sensor).
-    """
-    group = ha_get_entity_json(group_entity_id) or {}
-    members = (group.get("attributes") or {}).get("entity_id") or []
-    if isinstance(members, str):
-        members = [members]
-    if not isinstance(members, list):
-        return []
-
-    devices: List[Dict[str, Any]] = []
-    for ent_id in members:
-        ent_id = str(ent_id)
-        ent = ha_get_entity_json(ent_id) or {}
-        name = (ent.get("attributes") or {}).get("friendly_name") or ent_id
-        st = str(ent.get("state") or "unknown")
-
-        if st == "home":
-            at_home = True
-        elif st == "not_home":
-            at_home = False
-        else:
-            at_home = None
-
-        devices.append({
-            "id": _stable_device_id(ent_id),
-            "name": name,
-            "state": st,
-            "at_home": at_home,
-            "_ts": now_iso(),
-            "raw": {
-                "source": "homeassistant",
-                "group_entity": group_entity_id,
-                "entity_id": ent_id,
-                "entity": ent,
-            },
-        })
-
-    return devices
 
 
 def get_home_presence(access_token: str, home_id: int) -> str:
@@ -1105,6 +1039,107 @@ def discovery_object_ids(ha_device_id: str, device_id: int) -> Tuple[str, str, s
     old_json_object_id = f"{ha_device_id}_presence_{device_id}_json"
     return tracker_object_id, raw_object_id, old_json_object_id
 
+# -----------------------------
+# Home Assistant Presence (GPS) via HA Core API
+# -----------------------------
+def _stable_int_id(s: str) -> int:
+    # Stable positive int from string (for MQTT object_id / device id compatibility)
+    return int(zlib.crc32(s.encode("utf-8")) & 0x7FFFFFFF) or 1
+
+
+def ha_get_state(cfg: Dict[str, Any], entity_id: str) -> Dict[str, Any]:
+    entity_id = (entity_id or "").strip()
+    if not entity_id:
+        raise RuntimeError("HA entity_id is empty")
+
+    sup_token = os.getenv("SUPERVISOR_TOKEN")
+    if sup_token:
+        url = f"http://supervisor/core/api/states/{entity_id}"
+        headers = {"Authorization": f"Bearer {sup_token}"}
+        verify = False
+    else:
+        # Optional external fallback (only if user provided it)
+        ha_url = cfg.get("ha_url")
+        ha_token = cfg.get("ha_token")
+        if not ha_url or not ha_token:
+            raise RuntimeError("No SUPERVISOR_TOKEN and no ha_url/ha_token configured")
+        base = str(ha_url).rstrip("/")
+        url = f"{base}/api/states/{entity_id}"
+        headers = {"Authorization": f"Bearer {ha_token}"}
+        verify = bool(cfg.get("ha_verify_ssl", True))
+
+    r = requests.get(url, headers=headers, timeout=10, verify=verify)
+    if r.status_code != 200:
+        raise RuntimeError(f"HA state read failed ({r.status_code}) for {entity_id}: {r.text.strip()[:200]}")
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"HA state read returned non-dict for {entity_id}: {type(data)}")
+    return data
+
+
+def ha_presence_as_devices(cfg: Dict[str, Any], group_entity_id: str) -> List[Dict[str, Any]]:
+    """Return a list of device dicts in the same shape that MQTT expects, based on HA group/person states."""
+    group_state = ha_get_state(cfg, group_entity_id)
+
+    members = []
+    attrs = group_state.get("attributes") if isinstance(group_state, dict) else None
+    if isinstance(attrs, dict):
+        members = attrs.get("entity_id") or []
+    if isinstance(members, str):
+        members = [members]
+    if not isinstance(members, list):
+        members = []
+
+    # If it's not a group (or empty), treat the entity itself as the single member.
+    if not members:
+        members = [group_entity_id]
+
+    devices: List[Dict[str, Any]] = []
+    for ent in members:
+        if not isinstance(ent, str) or not ent.strip():
+            continue
+        ent = ent.strip()
+        try:
+            st = ha_get_state(cfg, ent)
+        except Exception as e:
+            # keep going; one broken entity should not kill the whole presence list
+            devices.append({
+                "id": _stable_int_id(ent),
+                "name": ent,
+                "state": "unknown",
+                "entity_id": ent,
+                "source": "ha",
+                "error": str(e),
+            })
+            continue
+
+        state_raw = str(st.get("state", "unknown"))
+        if state_raw == "home":
+            mapped = "home"
+        elif state_raw in ("not_home", "away"):
+            mapped = "not_home"
+        else:
+            mapped = "unknown"
+
+        friendly = None
+        a = st.get("attributes")
+        if isinstance(a, dict):
+            friendly = a.get("friendly_name") or a.get("name")
+        if not friendly:
+            friendly = ent
+
+        devices.append({
+            "id": _stable_int_id(ent),
+            "name": str(friendly),
+            "state": mapped,
+            "entity_id": ent,
+            "source": "ha",
+            "_ha_state": state_raw,
+        })
+
+    return devices
+
+
 
 def publish_discovery_for_devices(
     mpub: MqttPub,
@@ -1354,7 +1389,7 @@ def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
             devices = payload["devices"]
             try:
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw)
-                log(f"republished cached presence (source=ha) home={home_id} devices={len(devices)}")
+                log(f"republished cached presence home={home_id} devices={len(devices)}")
             except Exception:
                 pass
 
@@ -1420,10 +1455,8 @@ def main() -> None:
     ha_device_name = cfg["ha_device_name"]
     ha_device_id = cfg["ha_device_id"]
     enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
-    presence_source = str(cfg.get("presence_source", "tado")).strip().lower()
-    ha_presence_entity = str(cfg.get("ha_presence_entity", "group.family")).strip() or "group.family"
 
-    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll_seconds} presence_source={presence_source} ha_presence_entity={ha_presence_entity} enable_raw_sensors={enable_raw_sensors}")
+    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll_seconds} presence_source={cfg.get('presence_source', 'tado')} ha_presence_entity={cfg.get('ha_presence_entity', 'group.family')} enable_raw_sensors={enable_raw_sensors}")
 
     # Force OFF after every restart (your requirement)
     boot_auto_assist_force_off()
@@ -1569,20 +1602,25 @@ def main() -> None:
                             last_rl_log["presence"] = now_t
                     else:
                         try:
-                            if presence_source == "ha":
-                                devices = ha_presence_as_devices(ha_presence_entity)
+                            if str(cfg.get("presence_source", "tado")).lower() == "ha":
+                                # Presence comes from Home Assistant (GPS) via group/entity state
+                                ent = cfg.get("ha_presence_entity", "group.family")
+                                devices = ha_presence_as_devices(cfg, str(ent))
                             else:
+                                # Presence comes from Tado /mobileDevices (legacy)
                                 devices_raw = get_mobile_devices(access_token, home_id)
                                 devices = [normalize_presence(d) for d in devices_raw]
+
                             presence_devices_cache[home_id] = devices
                             presence_last_poll[home_id] = now_t
                             devices_polled = True
-                            # persist for 429/backoff republish
+
+                            # persist for republish after restart / 429 backoff
                             try:
                                 cache = read_json(LAST_DEVICES_PATH)
                                 if not isinstance(cache, dict):
                                     cache = {}
-                                cache[str(home_id)] = {"ts": int(now_t), "devices": devices, "source": presence_source}
+                                cache[str(home_id)] = {"ts": int(now_t), "devices": devices}
                                 write_json_atomic(LAST_DEVICES_PATH, cache)
                             except Exception:
                                 pass
@@ -1624,7 +1662,7 @@ def main() -> None:
                                 )
 
                             publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
-                            log(f"presence updated (source=ha) home={home_id} devices={len(devices)}")
+                            log(f"presence updated home={home_id} devices={len(devices)}")
                         else:
                             log("presence skipped (rate-limited, no cached devices)")
 
@@ -1686,7 +1724,7 @@ def main() -> None:
                             try:
 
                                 # refresh zones list occasionally
-                                if now_t - zones_last_refresh.get(home_id, 0) >= zones_refresh_seconds:
+                                if now_t - zones_last_refresh.get(home_id, 0.0) >= zones_refresh_seconds:
                                     zones_cache[home_id] = get_zones(access_token, home_id)
                                     zones_last_refresh[home_id] = now_t
 
