@@ -171,8 +171,14 @@ def load_config() -> Dict[str, Any]:
     except Exception:
         presence_poll_seconds = max(poll * 3, DEFAULT_PRESENCE_POLL_SECONDS)
     presence_poll_seconds = max(30, presence_poll_seconds)
-    presence_source = str(cfg.get("presence_source", "tado")).strip().lower()
-    ha_presence_entity = str(cfg.get("ha_presence_entity", "group.family")).strip() or "group.family"
+
+    # Presence source:
+    # - "tado": poll tado /mobileDevices (legacy)
+    # - "ha":   read Home Assistant entity (e.g. group.family) via Supervisor Core API proxy
+    presence_source = str(opt.get("presence_source", "tado")).strip().lower()
+    if presence_source not in ("tado", "ha"):
+        presence_source = "tado"
+    ha_presence_entity = str(opt.get("ha_presence_entity", "group.family")).strip() or "group.family"
 
 
     enable_raw_sensors = opt.get("enable_raw_sensors", True)
@@ -266,8 +272,8 @@ def load_config() -> Dict[str, Any]:
     return {
         "poll_seconds": poll,
         "presence_poll_seconds": presence_poll_seconds,
-        "presence_source": str(opt.get("presence_source", "tado")).strip().lower(),
-        "ha_presence_entity": str(opt.get("ha_presence_entity", "group.family")).strip() or "group.family",
+        "presence_source": presence_source,
+        "ha_presence_entity": ha_presence_entity,
         "enable_raw_sensors": enable_raw_sensors,
         "enable_open_window": enable_open_window,
         "open_window_poll_seconds": open_window_poll_seconds,
@@ -482,48 +488,32 @@ def get_mobile_devices(access_token: str, home_id: int) -> List[Dict[str, Any]]:
         raise RuntimeError(f"{path} failed status={status} data={data}")
     return data if isinstance(data, list) else []
 
-
-
-
 # -----------------------------
 # Home Assistant presence (GPS) via Supervisor Core API proxy
 # -----------------------------
-
 HA_CORE_PROXY_BASE = "http://supervisor/core/api"
 
 def ha_get_entity_state(entity_id: str) -> str:
     """Read an entity state from Home Assistant via Supervisor proxy.
-    Requires homeassistant_api: true in the add-on config.yaml.
+    Requires `homeassistant_api: true` in the add-on config.yaml.
     Uses SUPERVISOR_TOKEN injected by Supervisor.
     Returns state string (e.g. 'home', 'not_home', 'unknown', ...).
     """
     token = os.getenv("SUPERVISOR_TOKEN") or ""
     if not token:
-        raise RuntimeError("SUPERVISOR_TOKEN missing (set homeassistant_api: true in add-on config.yaml)")
+        raise RuntimeError("SUPERVISOR_TOKEN missing (check add-on config.yaml: homeassistant_api: true)")
     url = f"{HA_CORE_PROXY_BASE}/states/{entity_id}"
     r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
     if r.status_code != 200:
-        # include short body for debugging
         body = (r.text or "").strip()
         if len(body) > 200:
             body = body[:200] + "…"
         raise RuntimeError(f"HA state read failed ({r.status_code}) for {entity_id}: {body}")
-    try:
-        data = r.json()
-    except Exception:
-        raise RuntimeError(f"HA state read returned non-JSON for {entity_id}: {r.text[:200]}")
-    return str(data.get("state") or "unknown")
-
-def ha_state_to_presence(state: str) -> Optional[str]:
-    st = (state or "").strip().lower()
-    if st == "home":
-        return "HOME"
-    if st in ("not_home", "away"):
-        return "AWAY"
-    return None
+    data = r.json() if r.headers.get("content-type","").lower().startswith("application/json") else {}
+    return str((data or {}).get("state") or "unknown")
 
 def ha_presence_as_devices(entity_id: str, state: str) -> List[Dict[str, Any]]:
-    """Create a synthetic 'mobileDevices'-like list so existing logic can stay."""
+    """Create a synthetic mobileDevices-like list so existing logic can stay."""
     st = (state or "").strip().lower()
     if st not in ("home", "not_home"):
         return []
@@ -531,8 +521,13 @@ def ha_presence_as_devices(entity_id: str, state: str) -> List[Dict[str, Any]]:
         "id": 0,
         "name": f"HA:{entity_id}",
         "state": st,
-        "raw": {"geoTrackingEnabled": True, "source": "homeassistant", "entity_id": entity_id},
+        "raw": {"source": "homeassistant", "entity_id": entity_id},
     }]
+
+
+
+
+
 def get_home_presence(access_token: str, home_id: int) -> str:
     """Return current home presence as reported by Tado (/homes/<id>/state). Typically 'HOME' or 'AWAY'."""
     path = f"/homes/{home_id}/state"
@@ -1308,14 +1303,6 @@ def publish_presence(
 
 
 def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
-    # Avoid publishing stale /mobileDevices cache when presence is driven by Home Assistant.
-    if str(cfg.get("presence_source", "tado")).strip().lower() == "ha":
-        try:
-            write_json_atomic(LAST_DEVICES_PATH, {})
-        except Exception:
-            pass
-        return
-
     cache = read_json(LAST_DEVICES_PATH)
     if not isinstance(cache, dict):
         return
@@ -1396,6 +1383,8 @@ def main() -> None:
     ha_device_name = cfg["ha_device_name"]
     ha_device_id = cfg["ha_device_id"]
     enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
+    presence_source = str(cfg.get("presence_source", "tado")).strip().lower()
+    ha_presence_entity = str(cfg.get("ha_presence_entity", "group.family")).strip() or "group.family"
 
     log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll_seconds} presence_source={presence_source} ha_presence_entity={ha_presence_entity} enable_raw_sensors={enable_raw_sensors}")
 
@@ -1536,66 +1525,75 @@ def main() -> None:
                 now_t = time.time()
                 devices = presence_devices_cache.get(home_id, [])
                 if now_t - presence_last_poll.get(home_id, 0.0) >= presence_poll_seconds:
-                    if presence_source == "ha":
-                        try:
-                            ha_state = ha_get_entity_state(ha_presence_entity)
-                            devices = ha_presence_as_devices(ha_presence_entity, ha_state)
-                            # Only treat as "polled" if HA returned a concrete home/not_home state
-                            if devices:
-                                presence_devices_cache[home_id] = devices
-                                presence_last_poll[home_id] = now_t
-                                devices_polled = True
-                                # persist cache for restart republish (optional)
-                                try:
-                                    cache = read_json(LAST_DEVICES_PATH)
-                                    if not isinstance(cache, dict):
-                                        cache = {}
-                                    cache[str(home_id)] = {"ts": int(now_t), "devices": devices}
-                                    write_json_atomic(LAST_DEVICES_PATH, cache)
-                                except Exception:
-                                    pass
-                            else:
-                                presence_last_poll[home_id] = now_t
-                        except Exception as e:
-                            log(f"WARN: presence poll failed: {e}")
+                    # Respect persisted presence rate-limit cooldown
+                    if presence_rl_until and now_t < presence_rl_until:
+                        if now_t - last_rl_log.get("presence", 0.0) > 60:
+                            log(f"WARN: presence cooldown active -> skip /mobileDevices for {int(presence_rl_until - now_t)}s")
+                            last_rl_log["presence"] = now_t
                     else:
-                        # Tado mobileDevices polling (legacy)
-                        # Respect persisted presence rate-limit cooldown
-                        if presence_rl_until and now_t < presence_rl_until:
-                            if now_t - last_rl_log.get("presence", 0.0) > 60:
-                                log(f"WARN: presence cooldown active -> skip /mobileDevices for {int(presence_rl_until - now_t)}s")
-                                last_rl_log["presence"] = now_t
-                        else:
-                            try:
+                        try:
+                            if presence_source == "ha":
+                                ha_state = ha_get_entity_state(ha_presence_entity)
+                                devices = ha_presence_as_devices(ha_presence_entity, ha_state)
+                            else:
                                 devices_raw = get_mobile_devices(access_token, home_id)
                                 devices = [normalize_presence(d) for d in devices_raw]
-                                presence_devices_cache[home_id] = devices
-                                presence_last_poll[home_id] = now_t
-                                devices_polled = True
-                                # persist for 429/backoff republish
-                                try:
-                                    cache = read_json(LAST_DEVICES_PATH)
-                                    if not isinstance(cache, dict):
-                                        cache = {}
-                                    cache[str(home_id)] = {"ts": int(now_t), "devices": devices}
-                                    write_json_atomic(LAST_DEVICES_PATH, cache)
-                                except Exception:
-                                    pass
-                            except RateLimitError as e:
-                                sleep_s = e.retry_after if e.retry_after is not None else backoff_current
-                                sleep_s = max(5, int(sleep_s))
-                                sleep_s = min(sleep_s, backoff_max)
-                                log(f"WARN: Tado rate limit (429) on {e.endpoint} -> cooldown {sleep_s}s")
-                                presence_rl_until = now_t + sleep_s
-                                backoff_current = min(backoff_current * 2, backoff_max)
-                                # Persist cooldown
-                                try:
-                                    write_json_atomic(PRESENCE_RL_PATH, {"until": int(presence_rl_until), "backoff": int(backoff_current)})
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                log(f"WARN: presence poll failed: {e}")
-# Run it only when we actually polled /mobileDevices (to reduce API load).
+                            presence_devices_cache[home_id] = devices
+                            presence_last_poll[home_id] = now_t
+                            devices_polled = True
+                            # persist for 429/backoff republish
+                            try:
+                                cache = read_json(LAST_DEVICES_PATH)
+                                if not isinstance(cache, dict):
+                                    cache = {}
+                                cache[str(home_id)] = {"ts": int(now_t), "devices": devices, "source": presence_source}
+                                write_json_atomic(LAST_DEVICES_PATH, cache)
+                            except Exception:
+                                pass
+                        except RateLimitError as e:
+                            sleep_s = e.retry_after if e.retry_after is not None else backoff_current
+                            sleep_s = max(5, int(sleep_s))
+                            sleep_s = min(sleep_s, backoff_max)
+                            log(f"WARN: Tado rate limit (429) on {e.path} -> presence backoff {sleep_s}s")
+                            presence_rl_until = time.time() + sleep_s
+                            set_rate_limit_until("presence", presence_rl_until, path=e.path, retry_after=e.retry_after)
+                            republish_from_cache(mpub, cfg)
+                            presence_rate_limited = True
+                            # Do NOT overwrite presence with an empty list when rate-limited.
+                            # Try to reuse last persisted devices from disk for publishing.
+                            try:
+                                cache = read_json(LAST_DEVICES_PATH)
+                                if isinstance(cache, dict):
+                                    entry = cache.get(str(home_id))
+                                    if isinstance(entry, dict) and isinstance(entry.get("devices"), list):
+                                        devices = entry.get("devices")
+                                        presence_devices_cache[home_id] = devices
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            log(f"WARN: presence poll failed: {e}")
+
+                        if (not presence_rate_limited) or (isinstance(devices, list) and len(devices) > 0):
+
+                            if mpub.client and (loop == 1 or loop % DISCOVERY_REPUBLISH_EVERY_LOOPS == 0):
+                                publish_discovery_for_devices(
+                                    mpub,
+                                    discovery_prefix,
+                                    topic_prefix,
+                                    ha_device_name,
+                                    ha_device_id,
+                                    home_id,
+                                    devices,
+                                    enable_raw_sensors,
+                                )
+
+                            publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
+                            log(f"presence updated home={home_id} devices={len(devices)}")
+                        else:
+                            log("presence skipped (rate-limited, no cached devices)")
+
+                        # Presence Auto-Assist (HOME/AWAY) is independent from Open-Window.
+                        # Run it only when we actually polled /mobileDevices (to reduce API load).
                         try:
                             st_local = read_auto_assist_runtime()
                             if st_local.get("enabled") is True and devices_polled:
