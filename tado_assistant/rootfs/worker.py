@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import zlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List, Set, Callable
 
@@ -517,20 +518,51 @@ def ha_get_entity_state(entity_id: str) -> str:
     data = ha_get_entity_json(entity_id)
     return str((data or {}).get("state") or "unknown")
 
-def ha_presence_as_devices(entity_id: str, state: str) -> List[Dict[str, Any]]:
-    """Create a synthetic mobileDevices-like list so existing logic can stay."""
-    st = (state or "").strip().lower()
-    if st not in ("home", "not_home"):
+def _stable_device_id(entity_id: str) -> int:
+    """Stable positive int for entity_id -> used as device_id in MQTT topics/unique_ids."""
+    return int(zlib.crc32(entity_id.encode("utf-8")) & 0x7FFFFFFF)
+
+def ha_presence_as_devices(group_entity_id: str) -> List[Dict[str, Any]]:
+    """
+    Expand a HA group (e.g. group.family) into a synthetic mobileDevices-like list.
+    This keeps MQTT discovery/publish logic unchanged (per-person device_tracker + raw sensor).
+    """
+    group = ha_get_entity_json(group_entity_id) or {}
+    members = (group.get("attributes") or {}).get("entity_id") or []
+    if isinstance(members, str):
+        members = [members]
+    if not isinstance(members, list):
         return []
-    return [{
-        "id": 0,
-        "name": f"HA:{entity_id}",
-        "state": st,
-        "raw": {"source": "homeassistant", "entity_id": entity_id},
-    }]
 
+    devices: List[Dict[str, Any]] = []
+    for ent_id in members:
+        ent_id = str(ent_id)
+        ent = ha_get_entity_json(ent_id) or {}
+        name = (ent.get("attributes") or {}).get("friendly_name") or ent_id
+        st = str(ent.get("state") or "unknown")
 
+        if st == "home":
+            at_home = True
+        elif st == "not_home":
+            at_home = False
+        else:
+            at_home = None
 
+        devices.append({
+            "id": _stable_device_id(ent_id),
+            "name": name,
+            "state": st,
+            "at_home": at_home,
+            "_ts": now_iso(),
+            "raw": {
+                "source": "homeassistant",
+                "group_entity": group_entity_id,
+                "entity_id": ent_id,
+                "entity": ent,
+            },
+        })
+
+    return devices
 
 
 def get_home_presence(access_token: str, home_id: int) -> str:
