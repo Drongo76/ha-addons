@@ -1354,7 +1354,7 @@ def republish_from_cache(mpub: MqttPub, cfg: Dict[str, Any]) -> None:
             devices = payload["devices"]
             try:
                 publish_presence(mpub, topic_prefix, home_id, devices, enable_raw)
-                log(f"republished cached presence home={home_id} devices={len(devices)}")
+                log(f"republished cached presence (source=ha) home={home_id} devices={len(devices)}")
             except Exception:
                 pass
 
@@ -1624,7 +1624,7 @@ def main() -> None:
                                 )
 
                             publish_presence(mpub, topic_prefix, home_id, devices, enable_raw_sensors)
-                            log(f"presence updated home={home_id} devices={len(devices)}")
+                            log(f"presence updated (source=ha) home={home_id} devices={len(devices)}")
                         else:
                             log("presence skipped (rate-limited, no cached devices)")
 
@@ -1686,7 +1686,7 @@ def main() -> None:
                             try:
 
                                 # refresh zones list occasionally
-                                if now_t - zones_last_refresh.get(home_id, now_t) >= zones_refresh_seconds:
+                                if now_t - zones_last_refresh.get(home_id, 0) >= zones_refresh_seconds:
                                     zones_cache[home_id] = get_zones(access_token, home_id)
                                     zones_last_refresh[home_id] = now_t
 
