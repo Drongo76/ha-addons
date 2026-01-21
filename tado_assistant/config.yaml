@@ -1,5 +1,5 @@
 name: "Tado Assistant (Ingress)"
-version: "1.2.5"
+version: "1.2.6"
 slug: tado_assistant
 description: "Tado Assistant"
 
@@ -16,23 +16,66 @@ boot: auto
 # WICHTIG: verhindert docker --init (tini) => s6 bleibt PID1
 init: false
 
-# Allow Home Assistant Core API access via Supervisor proxy:
-# http://supervisor/core/api/...
-homeassistant_api: true
+# ✅ Ingress wieder aktiv (sonst fehlt "Benutzeroberfläche öffnen")
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_icon: "mdi:thermostat"
+webui: "http://[HOST]:[PORT:8099]/"
 
-# (Optional) Supervisor API access (not required for core proxy, but useful later)
+# Minimal und sicher: nur /data schreiben (Tokens etc.)
+map:
+  - data:rw
+
+# Rechte / APIs
+host_network: false
+
+# ✅ Für HA-API aus dem Add-on (Supervisor/Core Proxy)
+homeassistant_api: true
 hassio_api: true
-hassio_role: default
+
+docker_api: false
+full_access: false
+privileged: []
+devices: []
+usb: false
+uart: false
+gpio: false
+
+# Optionen (werden nach /data/options.json gemountet)
+options:
+  poll_seconds: 300
+  presence_poll_seconds: 30
+
+  # Presence aus HA (GPS)
+  presence_source: "ha"
+  ha_presence_entity: "group.family"
+
+  enable_raw_sensors: true
+  enable_open_window: true
+  open_window_poll_seconds: 120
+  zones_refresh_seconds: 21600
+
+  mqtt_enabled: false
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_topic_prefix: "tado_assistant"
+  mqtt_discovery_prefix: "homeassistant"
 
 schema:
   poll_seconds: int(5,3600)
-  presence_poll_seconds: int(30,86400)
-  presence_source: list(tado|ha)
+  presence_poll_seconds: int(5,86400)
+
+  presence_source: list(ha|tado)
   ha_presence_entity: str?
+
   enable_raw_sensors: bool
   enable_open_window: bool
   open_window_poll_seconds: int(30,3600)
   zones_refresh_seconds: int(300,86400)
+
   mqtt_enabled: bool
   mqtt_host: str?
   mqtt_port: int(1,65535)
@@ -40,7 +83,3 @@ schema:
   mqtt_password: password?
   mqtt_topic_prefix: str?
   mqtt_discovery_prefix: str?
-
-options:
-  presence_source: ha
-  ha_presence_entity: group.family
