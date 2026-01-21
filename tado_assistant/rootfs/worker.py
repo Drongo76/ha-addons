@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List, Set, Callable
 
 import requests
+import zlib
 
 try:
     import paho.mqtt.client as mqtt
@@ -257,6 +258,11 @@ def load_config() -> Dict[str, Any]:
 
     discovery_prefix = opt.get("mqtt_discovery_prefix") or opt.get("discovery_prefix") or "homeassistant"
     discovery_prefix = str(discovery_prefix).strip().strip("/")
+    # Presence is read from Home Assistant (GPS) via Supervisor API (no /mobileDevices)
+    presence_source = "ha"
+
+    ha_presence_entity = opt.get("ha_presence_entity") or "group.family"
+    ha_presence_entity = str(ha_presence_entity).strip() or "group.family"
 
     ha_device_name = opt.get("ha_device_name") or "Tado Assistant"
     ha_device_id = opt.get("ha_device_id") or "tado_assistant"
@@ -276,6 +282,8 @@ def load_config() -> Dict[str, Any]:
         "topic_prefix": topic_prefix,
         "discovery_prefix": discovery_prefix,
         "ha_device_name": ha_device_name,
+        "presence_source": presence_source,
+        "ha_presence_entity": ha_presence_entity,
         "ha_device_id": ha_device_id,
         "raw": opt,
     }
@@ -375,6 +383,93 @@ class MqttPub:
     def publish_delete_retained(self, topic: str) -> None:
         self.publish(topic, "", retain=True)
 
+
+
+# -----------------------------
+# Home Assistant API (Presence via HA GPS)
+# -----------------------------
+HA_CORE_API_BASE = "http://supervisor/core/api"  # requires hassio_api: true in add-on config.yaml
+
+class HomeAssistantApiError(Exception):
+    pass
+
+def ha_get_state(entity_id: str, timeout: int = 10) -> Dict[str, Any]:
+    """Read a single HA entity state via Supervisor proxy.
+    Returns the JSON dict from /api/states/<entity_id>.
+    """
+    token = os.getenv("SUPERVISOR_TOKEN")
+    if not token:
+        raise HomeAssistantApiError("SUPERVISOR_TOKEN missing (enable hassio_api: true in add-on config.yaml)")
+    url = f"{HA_CORE_API_BASE}/states/{entity_id}"
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    if r.status_code != 200:
+        raise HomeAssistantApiError(f"HA state read failed ({r.status_code}) for {entity_id}: {r.text[:200]}")
+    try:
+        data = r.json()
+    except Exception as e:
+        raise HomeAssistantApiError(f"HA state JSON parse failed for {entity_id}: {e}")
+    if not isinstance(data, dict):
+        raise HomeAssistantApiError(f"HA state payload invalid for {entity_id}: {type(data)}")
+    return data
+
+def _entity_to_int_id(entity_id: str) -> int:
+    # Deterministic 32-bit id for MQTT discovery object_ids (this worker expects int ids).
+    return int(zlib.crc32(entity_id.encode("utf-8")) & 0x7FFFFFFF) or 1
+
+def ha_get_presence_devices(group_entity: str) -> List[Dict[str, Any]]:
+    """Return normalized presence devices from HA.
+    If group_entity is a group (e.g. group.family), we expand its members (attributes.entity_id).
+    """
+    group = ha_get_state(group_entity)
+    attrs = group.get("attributes") if isinstance(group, dict) else {}
+    members: List[str] = []
+    if isinstance(attrs, dict) and isinstance(attrs.get("entity_id"), list):
+        for e in attrs["entity_id"]:
+            if isinstance(e, str) and e.strip():
+                members.append(e.strip())
+
+    if not members:
+        members = [group_entity]
+
+    devices: List[Dict[str, Any]] = []
+    for ent in members:
+        try:
+            st = ha_get_state(ent)
+        except Exception as e:
+            devices.append({
+                "id": _entity_to_int_id(ent),
+                "name": ent,
+                "state": "unknown",
+                "at_home": None,
+                "_ts": now_iso(),
+                "raw": {"entity_id": ent, "error": str(e)},
+            })
+            continue
+
+        state = str(st.get("state") or "unknown").strip().lower()
+        if state == "home":
+            pres_state, at_home = "home", True
+        elif state == "not_home":
+            pres_state, at_home = "not_home", False
+        else:
+            pres_state, at_home = "unknown", None
+
+        name = ent
+        if isinstance(st.get("attributes"), dict):
+            fn = st["attributes"].get("friendly_name")
+            if isinstance(fn, str) and fn.strip():
+                name = fn.strip()
+
+        devices.append({
+            "id": _entity_to_int_id(ent),
+            "name": name,
+            "state": pres_state,
+            "at_home": at_home,
+            "_ts": now_iso(),
+            "raw": st,
+        })
+
+    return devices
 
 # -----------------------------
 # Tado API
@@ -1335,7 +1430,7 @@ def main() -> None:
     ha_device_id = cfg["ha_device_id"]
     enable_raw_sensors = bool(cfg.get("enable_raw_sensors", True))
 
-    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll_seconds} enable_raw_sensors={enable_raw_sensors}")
+    log(f"starting. poll_seconds={poll} presence_poll_seconds={presence_poll_seconds} presence_source={cfg.get('presence_source')} ha_presence_entity={cfg.get('ha_presence_entity')} enable_raw_sensors={enable_raw_sensors}")
 
     # Force OFF after every restart (your requirement)
     boot_auto_assist_force_off()
@@ -1477,12 +1572,16 @@ def main() -> None:
                     # Respect persisted presence rate-limit cooldown
                     if presence_rl_until and now_t < presence_rl_until:
                         if now_t - last_rl_log.get("presence", 0.0) > 60:
-                            log(f"WARN: presence cooldown active -> skip /mobileDevices for {int(presence_rl_until - now_t)}s")
+                            log(f"WARN: presence cooldown active -> skip presence source poll for {int(presence_rl_until - now_t)}s")
                             last_rl_log["presence"] = now_t
                     else:
                         try:
-                            devices_raw = get_mobile_devices(access_token, home_id)
-                            devices = [normalize_presence(d) for d in devices_raw]
+                            if cfg.get("presence_source") == "tado":
+                                devices_raw = get_mobile_devices(access_token, home_id)
+                                devices = [normalize_presence(d) for d in devices_raw]
+                            else:
+                                # Presence from Home Assistant (GPS): expands group members (e.g. group.family)
+                                devices = ha_get_presence_devices(str(cfg.get("ha_presence_entity") or "group.family"))
                             presence_devices_cache[home_id] = devices
                             presence_last_poll[home_id] = now_t
                             devices_polled = True
