@@ -1114,12 +1114,15 @@ def ha_presence_as_devices(cfg: Dict[str, Any], group_entity_id: str) -> List[Di
             continue
 
         state_raw = str(st.get("state", "unknown"))
+        # HA person entities can report zone names (e.g. "Arbeit") instead of not_home.
+        # For presence logic we treat any non-home, non-unknown state as "not_home".
         if state_raw == "home":
             mapped = "home"
-        elif state_raw in ("not_home", "away"):
-            mapped = "not_home"
-        else:
+        elif state_raw in ("unknown", "unavailable", "none", "", "None"):
             mapped = "unknown"
+        else:
+            # Includes not_home, away, and any zone name (work/school/...)
+            mapped = "not_home"
 
         friendly = None
         a = st.get("attributes")
