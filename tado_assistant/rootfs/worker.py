@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple, List, Set, Callable
 
 import requests
@@ -25,6 +25,9 @@ TOKENS_PATH = os.path.join(DATA_DIR, "tado_assistant_tokens.json")
 DISCOVERY_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_discovery_state.json")
 LAST_DEVICES_PATH = os.path.join(DATA_DIR, "tado_assistant_last_devices.json")
 RATE_LIMIT_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_rate_limit.json")
+
+ZONES_CACHE_PATH = os.path.join(DATA_DIR, "tado_assistant_zones_cache.json")
+API_BUDGET_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_api_budget.json")
 
 # Auto-Assist runtime (enabled is forced OFF on every boot)
 AUTO_ASSIST_STATE_PATH = os.path.join(DATA_DIR, "tado_assistant_auto_assist_state.json")
@@ -125,6 +128,80 @@ def get_rate_limit_until(key: str) -> float:
         return float(st.get(f"{key}_until") or 0)
     except Exception:
         return 0.0
+
+# -----------------------------
+# Daily API budget (prevents burning tado daily quota)
+# -----------------------------
+_API_BUDGET_LIMIT: int = 0  # 0 = disabled
+_API_BUDGET_RESET_HOUR_LOCAL: int = 12  # tado quota often resets around midday CET; configurable
+_api_budget_cache: Dict[str, Any] = {}
+
+def _local_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone()
+
+def _budget_day_key(reset_hour: int) -> str:
+    now = _local_now()
+    # "budget day" starts at reset_hour local time
+    if now.hour < reset_hour:
+        day = (now.date() - timedelta(days=1))
+    else:
+        day = now.date()
+    return day.isoformat()
+
+def _seconds_until_next_reset(reset_hour: int) -> int:
+    now = _local_now()
+    today_reset = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+    if now < today_reset:
+        nxt = today_reset
+    else:
+        nxt = today_reset + timedelta(days=1)
+    return max(60, int((nxt - now).total_seconds()))
+
+def load_api_budget_state() -> Dict[str, Any]:
+    st = read_json(API_BUDGET_STATE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    return st
+
+def save_api_budget_state(st: Dict[str, Any]) -> None:
+    try:
+        write_json_atomic(API_BUDGET_STATE_PATH, st)
+    except Exception:
+        pass
+
+def api_budget_init(limit: int, reset_hour_local: int = 12) -> None:
+    global _API_BUDGET_LIMIT, _API_BUDGET_RESET_HOUR_LOCAL, _api_budget_cache
+    _API_BUDGET_LIMIT = int(limit or 0)
+    _API_BUDGET_RESET_HOUR_LOCAL = int(reset_hour_local or 12)
+
+    st = load_api_budget_state()
+    day_key = _budget_day_key(_API_BUDGET_RESET_HOUR_LOCAL)
+    if st.get("day") != day_key:
+        st = {"day": day_key, "used": 0, "limit": _API_BUDGET_LIMIT}
+        save_api_budget_state(st)
+    _api_budget_cache = st
+
+def api_budget_consume_or_raise(path: str, n: int = 1) -> None:
+    # If disabled -> no-op
+    if _API_BUDGET_LIMIT <= 0:
+        return
+
+    st = _api_budget_cache or load_api_budget_state()
+    day_key = _budget_day_key(_API_BUDGET_RESET_HOUR_LOCAL)
+    if st.get("day") != day_key:
+        st = {"day": day_key, "used": 0, "limit": _API_BUDGET_LIMIT}
+
+    used = int(st.get("used") or 0)
+    limit = int(st.get("limit") or _API_BUDGET_LIMIT or 0)
+    if limit > 0 and used + n > limit:
+        # Treat like a rate-limit: pause until reset to avoid endless 429 hammering
+        raise RateLimitError(path=f"daily_budget:{path}", retry_after=_seconds_until_next_reset(_API_BUDGET_RESET_HOUR_LOCAL))
+
+    st["used"] = used + n
+    st["limit"] = limit
+    _api_budget_cache = st
+    save_api_budget_state(st)
+
 def tokens_exist() -> bool:
     return os.path.exists(TOKENS_PATH)
 
@@ -247,6 +324,23 @@ def load_config() -> Dict[str, Any]:
     rate_backoff = max(5, rate_backoff)
     rate_backoff_max = max(rate_backoff, rate_backoff_max)
 
+   
+    api_daily_limit = opt.get("api_daily_limit", 0)
+    try:
+        api_daily_limit = int(api_daily_limit)
+    except Exception:
+        api_daily_limit = 0
+    if api_daily_limit < 0:
+        api_daily_limit = 0
+
+    api_reset_hour_local = opt.get("api_reset_hour_local", 12)
+    try:
+        api_reset_hour_local = int(api_reset_hour_local)
+    except Exception:
+        api_reset_hour_local = 12
+    if api_reset_hour_local < 0 or api_reset_hour_local > 23:
+        api_reset_hour_local = 12
+
     mcfg = opt.get("mqtt", {})
     if not isinstance(mcfg, dict):
         mcfg = {}
@@ -292,6 +386,8 @@ def load_config() -> Dict[str, Any]:
         "tado_home_ids": tado_home_ids,
         "rate_limit_backoff_seconds": rate_backoff,
         "rate_limit_backoff_max_seconds": rate_backoff_max,
+        "api_daily_limit": api_daily_limit,
+        "api_reset_hour_local": api_reset_hour_local,
         "mqtt": mcfg,
         "topic_prefix": topic_prefix,
         "discovery_prefix": discovery_prefix,
@@ -428,6 +524,7 @@ def api_request(method: str, path: str, access_token: str, params: Optional[dict
 
     def _do_request(tok: str) -> Tuple[int, Any, Dict[str, str]]:
         headers = {"Authorization": f"Bearer {tok}"}
+        api_budget_consume_or_raise(path)
         r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=HTTP_TIMEOUT)
         resp_headers = {k: v for k, v in r.headers.items()}
         try:
@@ -558,6 +655,24 @@ def get_zones(access_token: str, home_id: int) -> List[Dict[str, Any]]:
         raise RuntimeError(f"/homes/{home_id}/zones failed status={status} data={data}")
     return data if isinstance(data, list) else []
 
+
+
+def load_zones_cache_disk(home_id: int) -> Optional[List[Dict[str, Any]]]:
+    st = read_json(ZONES_CACHE_PATH)
+    if not isinstance(st, dict):
+        return None
+    entry = st.get(str(home_id))
+    if not isinstance(entry, dict):
+        return None
+    zones = entry.get("zones")
+    return zones if isinstance(zones, list) else None
+
+def save_zones_cache_disk(home_id: int, zones: List[Dict[str, Any]]) -> None:
+    st = read_json(ZONES_CACHE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    st[str(home_id)] = {"ts": int(time.time()), "zones": zones}
+    write_json_atomic(ZONES_CACHE_PATH, st)
 
 def get_zone_state(access_token: str, home_id: int, zone_id: int) -> Dict[str, Any]:
     status, data, headers = api_request("GET", f"/homes/{home_id}/zones/{zone_id}/state", access_token)
@@ -1426,6 +1541,9 @@ def save_cached_home_ids(home_ids: List[int]) -> None:
 def main() -> None:
     cfg = load_config()
 
+    # Initialize optional daily API budget (0 = disabled)
+    api_budget_init(int(cfg.get("api_daily_limit", 0) or 0), int(cfg.get("api_reset_hour_local", 12) or 12))
+
     poll = int(cfg["poll_seconds"])
     presence_poll_seconds = int(cfg.get("presence_poll_seconds", max(poll * 3, DEFAULT_PRESENCE_POLL_SECONDS)))
     presence_poll_seconds = max(30, presence_poll_seconds)
@@ -1446,6 +1564,20 @@ def main() -> None:
 
     # Open-Window runtime caches
     zones_cache: Dict[int, List[Dict[str, Any]]] = {}
+
+    # Preload zones cache from disk (helps survive daily quota / 429)
+    try:
+        st_z = read_json(ZONES_CACHE_PATH)
+        if isinstance(st_z, dict):
+            for hid_s, entry in st_z.items():
+                try:
+                    hid = int(hid_s)
+                except Exception:
+                    continue
+                if isinstance(entry, dict) and isinstance(entry.get("zones"), list):
+                    zones_cache[hid] = entry["zones"]
+    except Exception:
+        pass
     zones_last_refresh: Dict[int, float] = {}
     open_window_last_poll: Dict[int, float] = {}
     open_window_runtime: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -1728,8 +1860,20 @@ def main() -> None:
 
                                 # refresh zones list occasionally
                                 if now_t - zones_last_refresh.get(home_id, 0.0) >= zones_refresh_seconds:
-                                    zones_cache[home_id] = get_zones(access_token, home_id)
-                                    zones_last_refresh[home_id] = now_t
+                                    try:
+                                        zones_cache[home_id] = get_zones(access_token, home_id)
+                                        save_zones_cache_disk(home_id, zones_cache[home_id])
+                                        zones_last_refresh[home_id] = now_t
+                                    except RateLimitError as e:
+                                        # If we hit 429 on /zones, fall back to cached zones (disk) to keep MQTT entities alive.
+                                        cached = load_zones_cache_disk(home_id)
+                                        if cached:
+                                            zones_cache[home_id] = cached
+                                            # Push next refresh far out to avoid hammering /zones while limited.
+                                            zones_last_refresh[home_id] = now_t + max(900, zones_refresh_seconds)
+                                            log(f"WARN: Tado rate limit (429) on {e.path} -> using cached zones ({len(cached)})")
+                                        else:
+                                            raise
 
                                 zones = zones_cache.get(home_id, [])
                                 if isinstance(zones, list) and zones:
